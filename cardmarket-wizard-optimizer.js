@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.2.2
+// @version      2.3.0
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
-// @match        https://www.cardmarket.com/*/Wants/ShoppingWizard/Results/*
+// @match        https://www.cardmarket.com/*/Wants/ShoppingWizard*
 // @run-at       document-idle
 // @grant        none
 // @noframes
@@ -12,10 +12,15 @@
 
 /*
  * HOW IT WORKS
+ * 0. Finds the wants list the wizard ran on (remembered from the wizard form,
+ *    else matched against your lists by card names). No picker.
  * 1. Reads sellers, shipping and offered articles off the wizard results page.
- * 2. Sweeps each seller's offers filtered to your wants list, paging through them:
+ * 2. Sweeps each seller's offers filtered to that wants list, paging through them:
  *    a few requests per seller instead of one per card, then double-checks the
  *    result against the cards the wizard already proved that seller stocks.
+ *    Cardmarket applies each card's own options from the list (language,
+ *    minimum condition, expansion, foil/signed/altered) to these pages, and
+ *    to the by-name fallback too, so the script keeps no filters of its own.
  * 3. Scores line-ups as COMPLETE ORDERS — a basket is extended until it covers
  *    every reachable card, else it looks cheap by omitting expensive ones.
  * 4. Parking a card recalculates instantly from the stored scan.
@@ -34,11 +39,14 @@
    * Config
    */
 
-  const CFG_KEY = 'cmSSO.cfg.v2';
-  const CACHE_KEY = 'cmSSO.cache.v2';
+  const CFG_KEY = 'cmSSO.cfg.v3';
+  const CACHE_KEY = 'cmSSO.cache.v3';
   const SCAN_KEY = 'cmSSO.scan.v2';
   const EXCL_KEY = 'cmSSO.excluded.v1';
-  const PARAM_KEY = 'cmSSO.searchParam.v1';
+  // The wants list the wizard form was last opened or submitted with, and the
+  // list each results page turned out to belong to.
+  const LAST_LIST_KEY = 'cmSSO.lastWizardList.v1';
+  const RESULT_LIST_KEY = 'cmSSO.resultLists.v1';
 
   const DEFAULTS = {
     concurrency: 2,        // parallel requests inside one seller
@@ -46,29 +54,15 @@
     maxDelay: 900,
     cacheHours: 24,
     maxPagesPerCard: 2,    // offer pages to walk per seller+card
-    minCondition: 'PO',    // PO = accept anything
-    languages: ['English'], // [] = any language
-    allowFoil: true,
-    excludePlayset: true,
-    excludeAltered: true,
-    excludeSigned: true,
-    fastScan: true,        // sweep each seller's wants-filtered offer pages instead of one request per card
     rankMode: 'hybrid',    // 'hybrid' = wizard cards + stock size, 'wizard' = wizard cards only
     maxCombo: 12,          // how many parcels the slider may reach
     defaultShipping: 1.70, // fallback when the wizard didn't show one
   };
 
-  const CONDITIONS = ['MT', 'NM', 'EX', 'GD', 'LP', 'PL', 'PO'];
-  const COND_NAMES = {
-    'Mint': 'MT', 'Near Mint': 'NM', 'Excellent': 'EX', 'Good': 'GD',
-    'Light Played': 'LP', 'Played': 'PL', 'Poor': 'PO',
-  };
   const LANGUAGE_NAMES = [
     'English', 'French', 'German', 'Spanish', 'Italian', 'Simplified Chinese',
     'Japanese', 'Portuguese', 'Russian', 'Korean', 'Traditional Chinese',
   ];
-  // Candidate query params for the seller offer search; probed once, then cached.
-  const SEARCH_PARAM_CANDIDATES = ['name', 'searchString', 'productName', 'cardName'];
 
   const cfg = Object.assign({}, DEFAULTS, readJSON(CFG_KEY, {}));
 
@@ -112,12 +106,6 @@
     return String(s || '').replace(/\(v\.?\s*\d+\)/gi, '').split('//')[0].trim();
   }
 
-  function condOK(code) {
-    if (!code) return true;
-    const want = CONDITIONS.indexOf(cfg.minCondition);
-    const has = CONDITIONS.indexOf(code);
-    return has === -1 || want === -1 || has <= want;
-  }
 
   const [LANG_SEG, GAME_SEG] = location.pathname.split('/').filter(Boolean);
 
@@ -125,14 +113,14 @@
    * Cache
    */
 
+  // The wants list this results page belongs to: { id, name, how } once found.
+  let WANTLIST = null;
+
   let cache = readJSON(CACHE_KEY, {});
   function filterHash() {
-    // The wants list is part of the key: a sweep filtered to list A never saw
-    // the cards on list B, and reusing it would report them as unavailable.
-    const list = (typeof document !== 'undefined'
-      && document.querySelector('#cmSSO-wantlist')?.value) || '';
-    return [cfg.minCondition, cfg.languages.join('|'), cfg.allowFoil,
-      cfg.excludePlayset, cfg.excludeAltered, cfg.excludeSigned, list].join('~');
+    // The wants list is the whole filter: a sweep filtered to list A never saw
+    // the cards on list B (or saw them under A's options), so it is the key.
+    return WANTLIST?.id || 'nolist';
   }
   function cacheGet(seller, cardKey) {
     const e = cache[`${seller}||${cardKey}||${filterHash()}`];
@@ -187,11 +175,18 @@
     return new DOMParser().parseFromString(text, 'text/html');
   }
 
-  function sellerSearchUrl(seller, cardName, param, page) {
+  /*
+   * A seller's offers for one card. `name` is the only name filter seller pages
+   * honour (searchString, productName and cardName are ignored and return the
+   * whole store). With idWantslist alongside, Cardmarket also applies that
+   * card's options from the list, so expansion, language and condition hold
+   * here exactly as on the wants-filtered sweep.
+   */
+  function sellerSearchUrl(seller, cardName, page, idWantslist) {
     const base = `${location.origin}/${LANG_SEG}/${GAME_SEG}/Users/${encodeURIComponent(seller)}/Offers/Singles`;
     const p = new URLSearchParams();
-    p.set(param, searchableName(cardName));
-    p.set('perSite', '50');
+    p.set('name', searchableName(cardName));
+    if (idWantslist) p.set('idWantslist', String(idWantslist));
     if (page > 1) p.set('site', String(page));
     return `${base}?${p.toString()}`;
   }
@@ -267,22 +262,10 @@
     }).filter((r) => r.price != null);
   }
 
-  let langUnknown = 0;
-
-  function offerAllowed(o) {
-    if (cfg.excludePlayset && o.playset) return false;
-    if (cfg.excludeAltered && o.altered) return false;
-    if (cfg.excludeSigned && o.signed) return false;
-    if (!cfg.allowFoil && o.foil) return false;
-    if (!condOK(o.cond)) return false;
-    if (cfg.languages.length) {
-      // A row whose language we could not read is rejected rather than assumed:
-      // guessing here would quietly put a foreign printing in your basket.
-      if (!o.language) { langUnknown++; return false; }
-      if (!cfg.languages.includes(o.language)) return false;
-    }
-    return true;
-  }
+  // Everything else (language, condition, expansion, foil, signed, altered) is
+  // already applied by Cardmarket from the wants list. A playset's price is for
+  // four cards, so it would be mispriced as one copy.
+  const offerAllowed = (o) => !o.playset;
 
   /*
    * Parsing: the wizard results page
@@ -367,94 +350,129 @@
     return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  function wantlistsFromDoc(doc) {
-    const seen = new Set();
-    const out = [];
-    const add = (id, name) => {
-      id = String(id || '').trim();
-      if (!/^\d+$/.test(id) || seen.has(id)) return;
-      seen.add(id);
-      out.push({ id, name: String(name || '').trim() || `Wants list ${id}` });
-    };
-
-    // The filter panel is rendered client-side, so a plain fetch sees only its
-    // props attribute — which is where the real list names live.
-    doc.querySelectorAll('[data-props]').forEach((el) => {
-      const raw = el.getAttribute('data-props');
-      if (!raw || raw.indexOf('idWantslistOptions') === -1) return;
-      try {
-        const props = JSON.parse(raw);
-        (props.options?.idWantslistOptions || []).forEach((o) => add(o.value, o.label));
-      } catch { /* not the panel we wanted */ }
-    });
-    if (out.length) return out;
-
-    // Already-hydrated page: read the picker itself.
-    doc.querySelectorAll('select[name="idWantslist"] option')
-      .forEach((o) => add(o.getAttribute('value'), o.textContent));
-    if (out.length) return out;
-
-    // Last resort: the Wants overview, whose links all read "View / Edit list",
-    // so take the name from the surrounding row instead of the link text.
-    const generic = /view|edit|delete|share|copy|list$/i;
-    doc.querySelectorAll('a[href*="/Wants/"]').forEach((a) => {
-      const m = (a.getAttribute('href') || '').match(/\/Wants\/(\d+)/);
-      if (!m) return;
-      let name = a.textContent.trim();
-      if (!name || generic.test(name)) {
-        const row = a.closest('tr, .row, li, .card');
-        const head = row && row.querySelector('h1, h2, h3, h4, h5, h6, strong, b, td, .col');
-        const text = (head ? head.textContent : '').replace(/\s+/g, ' ').trim();
-        name = text && !generic.test(text) ? text.slice(0, 60) : '';
-      }
-      add(m[1], name);
-    });
-    return out;
-  }
-
-  async function fetchWantlists(sellerHint) {
-    if (sellerHint) {
-      try {
-        const doc = await httpGetDoc(
-          `${location.origin}/${LANG_SEG}/${GAME_SEG}/Users/${encodeURIComponent(sellerHint)}/Offers/Singles`);
-        const lists = wantlistsFromDoc(doc);
-        if (lists.length) return lists;
-      } catch { /* fall through */ }
-    }
-    const doc = await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Wants`);
-    return wantlistsFromDoc(doc);
-  }
-
   /*
-   * Probe: find the query parameter the offer search uses
+   * Which wants list did this wizard run use?
+   *
+   * The results page does not say. So: the wizard form page (also matched by
+   * this script) remembers the list it was opened or submitted with, and every
+   * candidate is checked against the results by card names before it is used.
+   * When nothing was remembered, your lists are tried newest first and the one
+   * holding the wizard's cards wins.
    */
 
-  async function probeSearchParam(seller, knownCardName) {
-    const cached = localStorage.getItem(PARAM_KEY);
-    const order = cached ? [cached, ...SEARCH_PARAM_CANDIDATES.filter((p) => p !== cached)] : SEARCH_PARAM_CANDIDATES;
-    const target = normName(knownCardName);
+  const listIdFrom = (href) => {
+    const s = String(href || '');
+    const m = s.match(/[?&]idWantsList=(\d+)/i) || s.match(/\/Wants\/(\d+)(?:[/?#]|$)/);
+    return m ? m[1] : null;
+  };
 
-    for (const param of order) {
-      try {
-        const doc = await httpGetDoc(sellerSearchUrl(seller, knownCardName, param, 1));
-        const rows = parseOfferRows(doc);
-        if (rows.some((r) => normName(r.name) === target)) {
-          localStorage.setItem(PARAM_KEY, param);
-          return param;
-        }
-      } catch (e) {
-        if (String(e.message).startsWith('blocked')) throw e;
-      }
-      await sleep(jitter());
+  // Every wants list id the overview links to, newest (highest id) first.
+  function wantlistIdsFromDoc(doc) {
+    const ids = new Set();
+    doc.querySelectorAll('a[href*="/Wants/"], a[href*="idWantsList="]').forEach((a) => {
+      const id = listIdFrom(a.getAttribute('href'));
+      if (id) ids.add(id);
+    });
+    return [...ids].sort((a, b) => Number(b) - Number(a));
+  }
+
+  // A wants list page: its title and the card names on it.
+  async function fetchWantsList(id) {
+    const doc = await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Wants/${id}`);
+    const table = doc.querySelector('table');
+    const keys = new Set();
+    if (table) {
+      const ths = [...table.querySelectorAll('thead th')];
+      let col = ths.findIndex((th) => th.classList.contains('name'));
+      if (col < 0) col = 3;
+      table.querySelectorAll('tbody tr').forEach((tr) => {
+        const td = tr.children[col];
+        const name = td ? td.textContent.trim() : '';
+        if (name) keys.add(normName(name));
+      });
     }
-    return null;
+    const name = (doc.title || '').split('|')[0].trim() || `Wants list ${id}`;
+    return { id, name, keys };
+  }
+
+  // On the wizard form: remember the list it runs on.
+  function rememberWizardList() {
+    const save = (id) => { if (id) writeJSON(LAST_LIST_KEY, { id: String(id), t: Date.now() }); };
+    save(listIdFrom(location.search));
+    document.addEventListener('submit', (e) => {
+      const f = e.target;
+      const field = f && f.querySelector && f.querySelector('[name="idWantsList"], [name="idWantslist"]');
+      save(field && /^\d+$/.test(field.value) ? field.value : listIdFrom(f?.getAttribute?.('action')));
+    }, true);
+    document.addEventListener('change', (e) => {
+      const el = e.target;
+      if (el && /^idWants?list$/i.test(el.name || '') && /^\d+$/.test(el.value)) save(el.value);
+    }, true);
+  }
+
+  async function detectWantlist(wiz, onStep) {
+    const wizardKeys = new Set(wantedFromWizard(wiz).map((w) => w.key));
+    // cover: share of the wizard's cards on the list. fit: share of the list
+    // the wizard placed. An older, bigger list can hold every card too, so a
+    // list must fit well as well as cover to be taken without looking further.
+    const measure = (keys) => {
+      let hit = 0;
+      wizardKeys.forEach((k) => { if (keys.has(k)) hit++; });
+      return { cover: wizardKeys.size ? hit / wizardKeys.size : 0, fit: keys.size ? hit / keys.size : 0 };
+    };
+    const tried = new Set();
+    let best = null;
+    const attempt = async (id, how, needCover, needFit = 0) => {
+      if (!id || tried.has(id)) return null;
+      tried.add(id);
+      onStep?.(`Checking wants list ${id}…`);
+      let list;
+      try { list = await fetchWantsList(id); } catch (e) {
+        if (String(e.message).startsWith('blocked')) throw e;
+        return null;
+      }
+      const { cover, fit } = measure(list.keys);
+      const found = { ...list, how, coverage: cover, fit };
+      if (cover >= needCover && fit >= needFit) return found;
+      if (!best || cover + fit > best.coverage + best.fit) best = { ...found, how: 'closest match' };
+      return null;
+    };
+
+    const path = location.pathname;
+    const byResult = readJSON(RESULT_LIST_KEY, {});
+    const last = readJSON(LAST_LIST_KEY, null);
+    const fresh = last && Date.now() - last.t < 48 * 3600e3 ? last.id : null;
+    const linked = [...document.querySelectorAll('a[href*="/Wants/"], a[href*="idWantsList="]')]
+      .map((a) => listIdFrom(a.getAttribute('href'))).filter(Boolean);
+
+    let hit = await attempt(byResult[path], 'used for this page before', 0.5);
+    for (const id of linked) { if (hit) break; hit = await attempt(id, 'linked from this page', 0.5, 0.5); }
+    if (!hit) hit = await attempt(fresh, 'the list you opened the wizard with', 0.8);
+
+    if (!hit) {
+      const ids = wantlistIdsFromDoc(await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Wants`));
+      for (const id of ids.slice(0, 30)) {
+        if (aborted) break;
+        hit = await attempt(id, 'matched by its cards', 0.95, 0.8);
+        if (hit) break;
+        await sleep(jitter());
+      }
+    }
+    if (!hit && best && best.coverage >= 0.8) hit = best;
+    if (hit) {
+      byResult[path] = hit.id;
+      const keys = Object.keys(byResult);
+      keys.slice(0, Math.max(0, keys.length - 50)).forEach((k) => delete byResult[k]);
+      writeJSON(RESULT_LIST_KEY, byResult);
+    }
+    return hit;
   }
 
   /*
    * Scraping one seller × one card
    */
 
-  async function offersFor(seller, want, param, force) {
+  async function offersFor(seller, want, force) {
     // force skips the cache: the recovery pass exists precisely because the
     // sweep already stored an empty result for this card, and asking the cache
     // again would just hand that same empty answer straight back.
@@ -464,7 +482,7 @@
     const target = want.key;
     const units = [];
     for (let page = 1; page <= cfg.maxPagesPerCard; page++) {
-      const doc = await httpGetDoc(sellerSearchUrl(seller, want.name, param, page));
+      const doc = await httpGetDoc(sellerSearchUrl(seller, want.name, page, WANTLIST?.id));
       const rows = parseOfferRows(doc);
       rows.filter((r) => normName(r.name) === target && offerAllowed(r))
         .forEach((r) => { for (let i = 0; i < Math.min(r.count, 4); i++) units.push(r.price); });
@@ -909,9 +927,6 @@
     const section = document.createElement('section');
     section.id = 'cmSSO';
     section.className = 'mb-4';
-    const chk = (attrs, label, on) => `<div class="form-check form-check-inline">
-        <input class="form-check-input" type="checkbox" ${attrs}${on ? ' checked' : ''}>
-        <label class="form-check-label">${label}</label></div>`;
     section.innerHTML = `
       <h2>Fewer shipments</h2>
       <div class="bg-white border rounded p-3">
@@ -922,9 +937,9 @@
         </p>
 
         <div class="row g-2 align-items-end">
-          <div class="col-12 col-md-7">
-            <label class="form-label mb-1 small" for="cmSSO-wantlist">Wants list this wizard run used</label>
-            <select id="cmSSO-wantlist" class="form-select form-select-sm"><option value="">Loading your lists…</option></select>
+          <div class="col-12 col-md-7 small">
+            <div class="text-muted">Wants list</div>
+            <div id="cmSSO-wantlist">Finding the list this wizard ran on…</div>
           </div>
           <div class="col-12 col-md-5 d-flex gap-2">
             <button id="cmSSO-run" type="button" class="btn btn-primary btn-sm flex-grow-1"><span class="fonticon-wand me-2"></span>Scan sellers</button>
@@ -933,28 +948,15 @@
           </div>
         </div>
 
-        <details id="cmSSO-filters" class="mt-2">
-          <summary class="small text-muted">Filters · <span id="cmSSO-filter-sum"></span></summary>
+        <details id="cmSSO-tools" class="mt-2">
+          <summary class="small text-muted">Tools</summary>
           <div class="border rounded p-2 mt-2 small">
-            <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
-              <label for="cmSSO-cond">Condition</label>
-              <select id="cmSSO-cond" class="form-select form-select-sm w-auto">
-                ${CONDITIONS.map((c) => `<option value="${c}"${c === cfg.minCondition ? ' selected' : ''}>${c === 'PO' ? 'Any condition' : `${c} or better`}</option>`).join('')}
-              </select>
-            </div>
-            <div class="mb-1">Languages <span class="text-muted">— none ticked means any language</span></div>
-            <div class="mb-2">${LANGUAGE_NAMES.map((l) => chk(`data-lang="${l}"`, l, cfg.languages.includes(l))).join('')}</div>
-            <div class="mb-2">
-              ${chk('id="cmSSO-foil"', 'Foils allowed', cfg.allowFoil)}
-              ${chk('id="cmSSO-playset"', 'Skip playsets', cfg.excludePlayset)}
-              ${chk('id="cmSSO-altered"', 'Skip altered', cfg.excludeAltered)}
-              ${chk('id="cmSSO-signed"', 'Skip signed', cfg.excludeSigned)}
-            </div>
+            <p class="text-muted mb-2">Each card's language, condition, expansion and foil/signed/altered
+              options come from your wants list — edit them there.</p>
             <div class="d-flex flex-wrap gap-2 align-items-center">
               <button id="cmSSO-clear" type="button" class="btn btn-sm btn-outline-secondary">Clear saved prices</button>
               <button id="cmSSO-samples" type="button" class="btn btn-sm btn-outline-secondary"
                 title="Download the raw HTML of the pages this script reads, to help fix parsing">Save page samples</button>
-              <span class="text-muted">Filters apply to the next scan; prices are cached per filter set.</span>
             </div>
           </div>
         </details>
@@ -970,40 +972,9 @@
         <div id="cmSSO-results" class="mt-3"></div>
       </div>`;
 
-    // Labels sit next to their checkbox; make clicking them toggle it.
-    section.querySelectorAll('#cmSSO-filters .form-check-label').forEach((lab) => {
-      lab.style.cursor = 'pointer';
-      lab.addEventListener('click', () => lab.previousElementSibling?.click());
-    });
-
     const anchor = document.querySelector('#ShoppingWizardResult')?.closest('section');
     if (anchor) anchor.after(section); else document.querySelector('main')?.appendChild(section);
     return section;
-  }
-
-  function filterSummary() {
-    const langs = !cfg.languages.length ? 'any language'
-      : cfg.languages.length <= 2 ? cfg.languages.join(' / ') : `${cfg.languages.length} languages`;
-    const skips = [cfg.excludePlayset && 'playsets', cfg.excludeAltered && 'altered', cfg.excludeSigned && 'signed']
-      .filter(Boolean);
-    return [
-      langs,
-      cfg.minCondition === 'PO' ? 'any condition' : `${cfg.minCondition} or better`,
-      cfg.allowFoil ? 'foils ok' : 'no foils',
-      skips.length ? `no ${skips.join('/')}` : '',
-    ].filter(Boolean).join(' · ');
-  }
-
-  function readFilters(panel) {
-    cfg.minCondition = panel.querySelector('#cmSSO-cond').value;
-    cfg.languages = [...panel.querySelectorAll('[data-lang]')].filter((el) => el.checked)
-      .map((el) => el.getAttribute('data-lang'));
-    cfg.allowFoil = panel.querySelector('#cmSSO-foil').checked;
-    cfg.excludePlayset = panel.querySelector('#cmSSO-playset').checked;
-    cfg.excludeAltered = panel.querySelector('#cmSSO-altered').checked;
-    cfg.excludeSigned = panel.querySelector('#cmSSO-signed').checked;
-    writeJSON(CFG_KEY, cfg);
-    panel.querySelector('#cmSSO-filter-sum').textContent = filterSummary();
   }
 
   ui.note = (msg, kind = 'info') => {
@@ -1165,18 +1136,11 @@
     // Whatever the wants filter did not show, look up by name — the same
     // fallback the scan uses, so every card it priced can actually be found.
     const short = [...targets].filter(([k, t]) => have(k) < t.qty);
-    let param = localStorage.getItem(PARAM_KEY);
     for (const [key, t] of short) {
       if (aborted) break;
-      if (!param) {
-        try { param = await probeSearchParam(seller, t.name); } catch (e) {
-          if (String(e.message).startsWith('blocked')) throw e;
-        }
-        if (!param) continue;
-      }
       for (let page = 1; page <= cfg.maxPagesPerCard; page++) {
         let doc;
-        try { doc = await get(sellerSearchUrl(seller, t.name, param, page)); } catch (e) {
+        try { doc = await get(sellerSearchUrl(seller, t.name, page, wantlistId)); } catch (e) {
           if (String(e.message).startsWith('blocked')) throw e;
           break;
         }
@@ -1205,7 +1169,7 @@
 
   async function addBasketToCart(m, r, opts) {
     const dry = !!opts.dryRun;
-    const wantlistId = document.querySelector('#cmSSO-wantlist')?.value || null;
+    const wantlistId = WANTLIST?.id || null;
     const out = document.querySelector('#cmSSO-cart-out');
     out.innerHTML = `<div class="cmSSO-bar mb-1"><i style="width:0%"></i></div>
       <div class="small text-muted" data-status>Starting…</div><div class="cmSSO-log text-muted mt-1" data-log></div>`;
@@ -1384,9 +1348,8 @@
 
   // The page a seller's offers live on, filtered to your wants list when we have one.
   function sellerPageUrl(m, seller, sampleName) {
-    const id = document.querySelector('#cmSSO-wantlist')?.value || null;
-    return id ? sellerWantlistUrl(seller, id, 1)
-      : sellerSearchUrl(seller, sampleName, localStorage.getItem(PARAM_KEY) || 'name', 1);
+    const id = WANTLIST?.id || null;
+    return id ? sellerWantlistUrl(seller, id, 1) : sellerSearchUrl(seller, sampleName, 1, null);
   }
 
   async function diagnoseCart(m, r) {
@@ -1636,7 +1599,7 @@
     if (clashes.length) {
       items.push(`<li class="text-danger"><strong>The scan missed ${plural(clashes.length, 'card')} the wizard did find:</strong>
         ${clashes.slice(0, 6).map((x) => cardSearchLink(x.w.name)).join(', ')}${clashes.length > 6 ? ` +${clashes.length - 6}` : ''}.
-        Usually a saved scan from another wants list or tighter filters — clear saved prices and scan again.</li>`);
+        Usually a saved scan from another wants list or older list options — clear saved prices and scan again.</li>`);
     }
     if (m.nobodyHas.length) {
       items.push(`<li><strong>Not available from these ${m.S} sellers:</strong>
@@ -1817,12 +1780,9 @@
           <p class="mb-2">Not one of the ${m.S} sellers matched a single card, which means the scan
             failed rather than the sellers being empty.</p>
           <ul class="mb-2">
-            <li>${langUnknown > 0
-              ? `${langUnknown} offers were rejected because their language could not be read — untick all
-                 languages under <strong>Filters</strong> and run again to confirm.`
-              : 'The card names on the sellers\' pages did not match your list.'}</li>
-            <li>Your filters may be too tight — check condition and the skip options.</li>
-            <li>The wants list picked above may not be the one this wizard run used.</li>
+            <li>The card names on the sellers' pages did not match your list.</li>
+            <li>The options on your wants list (language, condition, expansion) may be too tight.</li>
+            <li>The wants list shown above may not be the one this wizard run used.</li>
           </ul>
           <button type="button" class="btn btn-sm btn-outline-danger" data-act="wipe">Clear saved prices and start over</button>
         </div>`;
@@ -1940,17 +1900,20 @@
     runBtn.disabled = true;
     stopBtn.hidden = false;
     panel.querySelector('.cmSSO-log').innerHTML = '';
-    readFilters(panel);
 
     try {
       // 1. Wanted cards
-      // The cards are the ones this wizard run placed; the wants list is only
-      // used to filter each seller's offers down to them.
+      // The cards are the ones this wizard run placed; the wants list filters
+      // each seller's offers down to them, with each card's own options.
       const wanted = wantedFromWizard(wiz);
-      const wantlistId = panel.querySelector('#cmSSO-wantlist').value || null;
       if (!wanted.length) { ui.note('No cards to look for.', 'warn'); return; }
-
+      if (wantlistReady) await wantlistReady;
+      const wantlistId = WANTLIST?.id || null;
       const fast = !!wantlistId;
+      if (!fast) {
+        ui.note('No wants list found for this wizard run, so cards are searched by name without '
+          + 'your list options (language, condition, expansion). Expect other printings.', 'warn');
+      }
 
       // Every seller gets scanned; the ranking only decides the order, so a
       // stopped run still has the most useful sellers done.
@@ -1958,20 +1921,9 @@
       const shipping = {};
       wiz.sellers.forEach((x) => { shipping[x.username] = x.shipping ?? cfg.defaultShipping; });
 
-      let param = null;
-      if (!fast) {
-        const probeSeller = wiz.sellers.find((s) => s.articles.length);
-        ui.progress(0, 1, 'Checking how seller search works…');
-        param = await probeSearchParam(probeSeller.username, probeSeller.articles[0].name);
-        if (!param) {
-          ui.note('Cardmarket\'s seller offer search did not respond as expected — nothing was scraped.', 'warn');
-          return;
-        }
-      }
-      langUnknown = 0;
       ui.note('Keep this tab open while it runs. Each seller is saved as it finishes, '
         + 'so running again picks up where it stopped.');
-      ui.note(`Filters: ${filterSummary()}.`);
+      if (fast) ui.note(`Wants list: ${WANTLIST.name} — its per-card options apply.`);
 
       const fresh = sellerNames.filter((n) => !cacheGet(n, SCANNED_MARK));
       const pagesEach = Math.max(1, Math.ceil((wanted.length * 3) / 20));   // ~3 printings per card, ~20 rows a page
@@ -2022,12 +1974,11 @@
               .filter((k) => wantedByKey.has(k) && !(matrix[seller][k] || []).length))];
 
             if (proof.length) {
-              param = param || await probeSearchParam(seller, wantedByKey.get(proof[0]).name);
               let recovered = 0;
               for (const key of proof) {
-                if (aborted || !param) break;
+                if (aborted) break;
                 try {
-                  const r = await offersFor(seller, wantedByKey.get(key), param, true);
+                  const r = await offersFor(seller, wantedByKey.get(key), true);
                   matrix[seller][key] = r.units;
                   if (r.units.length) recovered++;
                   if (!r.cached) await sleep(jitter());
@@ -2035,7 +1986,7 @@
               }
               if (recovered < proof.length) {
                 ui.note(`${seller}: ${proof.length - recovered} card${proof.length - recovered === 1 ? '' : 's'} the wizard found there `
-                  + 'did not pass your filters or could not be found.', 'warn');
+                  + 'are not listed there with your wants-list options (or have sold).', 'warn');
               }
             }
 
@@ -2062,7 +2013,7 @@
             const want = queue.shift();
             let hitCache = false;
             try {
-              const r = await offersFor(seller, want, param);
+              const r = await offersFor(seller, want);
               matrix[seller][want.key] = r.units;
               hitCache = r.cached;
             } catch (e) {
@@ -2085,10 +2036,6 @@
       }
 
       cacheFlush();
-      if (cfg.languages.length && langUnknown > 40) {
-        ui.note(`${langUnknown} offers were skipped because their language could not be read. `
-          + 'If coverage looks thin, untick all languages under Filters and compare.', 'warn');
-      }
       const usable = sellerNames.filter((s) => matrix[s]);
       writeJSON(SCAN_KEY, { t: Date.now(), wanted, matrix, shipping, sellerNames: usable });
       panel.querySelector('#cmSSO-reanalyse').hidden = false;
@@ -2109,7 +2056,8 @@
   async function saveSamples(wiz, panel) {
     panel.querySelector('#cmSSO-progress').hidden = false;
     const base = `${location.origin}/${LANG_SEG}/${GAME_SEG}`;
-    const listId = panel.querySelector('#cmSSO-wantlist').value || null;
+    if (wantlistReady) await wantlistReady;
+    const listId = WANTLIST?.id || null;
     const seller = wiz.sellers.find((s) => s.articles.length)?.username || wiz.sellers[0]?.username;
     const pages = [
       ['wizard-results', location.href],
@@ -2125,7 +2073,7 @@
       .replace(/(value=["'])[^"']*(["'][^>]*name=["']__cmtkn)/gi, '$1REDACTED$2')
       .replace(/("__cmtkn"\s*:\s*")[^"]*/g, '$1REDACTED');
 
-    const out = { saved: new Date().toISOString(), script: '2.2.2', listId, seller, pages: {},
+    const out = { saved: new Date().toISOString(), script: '2.3.0', listId, seller, pages: {},
       renderedWizard: scrub(document.documentElement.outerHTML) };
     for (const [name, url] of pages) {
       ui.note(`Saving ${name}…`);
@@ -2151,35 +2099,31 @@
    * Boot
    */
 
+  let wantlistReady = null;
+
   function boot() {
     if (document.querySelector('#cmSSO')) return;
+    // The wizard form: only note which wants list it runs on.
+    if (!/\/ShoppingWizard\/Results\//.test(location.pathname)) { rememberWizardList(); return; }
     const wiz = parseWizard();
     if (!wiz.sellers.length) return;
 
     injectStyles();
     const panel = buildPanel(wiz);
-    panel.querySelector('#cmSSO-filter-sum').textContent = filterSummary();
-    panel.querySelector('#cmSSO-filters').addEventListener('change', () => readFilters(panel));
     panel.querySelector('#cmSSO-results').addEventListener('click', onResultsClick);
 
-    (async () => {
-      const sel = panel.querySelector('#cmSSO-wantlist');
+    const info = panel.querySelector('#cmSSO-wantlist');
+    wantlistReady = (async () => {
       try {
-        const lists = await fetchWantlists(wiz.sellers[0]?.username);
-        sel.innerHTML = lists.length
-          ? '<option value="">— none (slower name search) —</option>'
-            + lists.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join('')
-          : '<option value="">No wants lists found</option>';
-        // Newest list first is usually the one the wizard was just run on.
-        // Prefer a wants list this page links to; else the newest list.
-        const linked = [...document.querySelectorAll('a[href*="/Wants/"]')]
-          .map((a) => ((a.getAttribute('href') || '').match(/\/Wants\/(\d+)(?:[/?#]|$)/) || [])[1])
-          .find((id) => id && lists.some((l) => l.id === id));
-        const newest = lists.slice().sort((a, b) => Number(b.id) - Number(a.id))[0];
-        if (linked) sel.value = linked; else if (newest) sel.value = newest.id;
-      } catch {
-        sel.innerHTML = '<option value="">Could not load your wants lists</option>';
-        ui.note('Could not read your wants lists. Reload the page, or scan without one (slower).', 'warn');
+        WANTLIST = await detectWantlist(wiz, (t) => { info.textContent = t; });
+      } catch { WANTLIST = null; }
+      if (WANTLIST) {
+        const href = `/${LANG_SEG}/${GAME_SEG}/Wants/${WANTLIST.id}`;
+        info.innerHTML = `<a href="${href}" target="_blank" rel="noopener"><strong>${esc(WANTLIST.name)}</strong></a>
+          <span class="text-muted">· ${esc(WANTLIST.how)}${WANTLIST.coverage < 0.95 ? `, ${pct(WANTLIST.coverage)} of the cards match` : ''}</span>`;
+      } else {
+        info.innerHTML = '<span class="text-danger">Could not tell which wants list this wizard ran on.</span> '
+          + '<span class="text-muted">Open the wizard from your wants list and run it again, or scan anyway (searches by name, ignores list options).</span>';
       }
     })();
 
