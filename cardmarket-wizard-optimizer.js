@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.4.0
+// @version      2.4.1
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard*
@@ -1103,8 +1103,12 @@
     }
   }
 
-  // The cart page, raw. The header carries the value; the body usually carries
-  // each article id, which lets us verify article by article.
+  /*
+   * The cart page. Every article is a tr[data-article-id] carrying its
+   * data-amount and data-name, inside a section per seller (each article is
+   * rendered twice, for desktop and mobile, so ids are de-duplicated). That
+   * gives exact per-article amounts: what landed, and what was already there.
+   */
   async function cartSnapshot() {
     try {
       const res = await fetch(`${location.origin}/${LANG_SEG}/${GAME_SEG}/ShoppingCart`,
@@ -1113,12 +1117,30 @@
       const html = await res.text();
       const doc = new DOMParser().parseFromString(html, 'text/html');
       const header = doc.querySelector('#cart');
-      return { value: parsePrice(header ? header.textContent : ''), html };
+      const arts = new Map();      // article id -> { amount, key, seller }
+      doc.querySelectorAll('tr[data-article-id]').forEach((tr) => {
+        const id = tr.getAttribute('data-article-id');
+        if (!id || arts.has(id)) return;
+        const sec = tr.closest('section[id^="seller"], [id^="seller"]');
+        arts.set(id, {
+          amount: parseInt(tr.getAttribute('data-amount'), 10) || 1,
+          key: normName(tr.getAttribute('data-name') || ''),
+          seller: (sec?.querySelector('a[href*="/Users/"]')?.textContent || '').trim(),
+        });
+      });
+      return { value: parsePrice(header ? header.textContent : ''), arts };
     } catch { return null; }
   }
 
-  const hasId = (snap, id) => !!snap && new RegExp(`(^|\\D)${id}(\\D|$)`).test(snap.html);
+  const amountOf = (snap, id) => snap?.arts.get(String(id))?.amount || 0;
   const valueGrew = (a, b) => !!a && !!b && a.value != null && b.value != null && b.value > a.value + 0.001;
+  // Copies of a card already in the cart from one seller, whichever article.
+  function heldFor(snap, seller, key) {
+    let n = 0;
+    const s = seller.toLowerCase();
+    snap?.arts.forEach((a) => { if (a.key === key && a.seller.toLowerCase() === s) n += a.amount; });
+    return n;
+  }
 
   // Read one seller's pages and pick live articles for every card we want there.
   async function collectSellerArticles(seller, wantlistId, targets) {
@@ -1213,6 +1235,7 @@
     const out = document.querySelector('#cmSSO-cart-out');
     out.innerHTML = `<div class="cmSSO-bar mb-1"><i style="width:0%"></i></div>
       <div class="small text-muted" data-status>Starting…</div><div class="cmSSO-log text-muted mt-1" data-log></div>`;
+    out.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     const bar = out.querySelector('.cmSSO-bar > i');
     const status = (t, frac) => { out.querySelector('[data-status]').textContent = t; bar.style.width = `${frac * 100}%`; };
     const log = (t) => {
@@ -1228,22 +1251,43 @@
       const targets = new Map();
       r.lines[p].forEach((x) => {
         const w = m.wanted[x.i];
-        const t = targets.get(w.key) || { name: w.name, price: 0, qty: 0 };
+        const t = targets.get(w.key) || { name: w.name, price: 0, qty: 0, want: 0 };
         t.qty += 1;
+        t.want += 1;
         t.price = Math.max(t.price, x.price);
         targets.set(w.key, t);
       });
       if (targets.size) bySeller.set(m.sellerNames[j], targets);
     });
     if (!bySeller.size) { out.innerHTML = '<div class="alert alert-warning">Nothing in this basket.</div>'; return; }
-    const wantedUnits = [...bySeller.values()].reduce((a, ts) => a + [...ts.values()].reduce((b, t) => b + t.qty, 0), 0);
+    const wantedUnits = [...bySeller.values()].reduce((a, ts) => a + [...ts.values()].reduce((b, t) => b + t.want, 0), 0);
+
+    // What the cart already holds counts towards the basket, so pressing Add
+    // twice (or after a partial run) never adds a card a second time.
+    let snap = null;
+    let already = 0;
+    if (!dry) {
+      snap = await cartSnapshot();
+      if (!snap) {
+        out.innerHTML = '<div class="alert alert-danger">Could not read your cart, so nothing was sent. Are you logged in?</div>';
+        return;
+      }
+      bySeller.forEach((targets, seller) => targets.forEach((t, key) => {
+        const held = Math.min(t.qty, heldFor(snap, seller, key));
+        t.qty -= held;
+        already += held;
+        if (!t.qty) targets.delete(key);
+      }));
+      if (already) log(`${plural(already, 'card')} of this basket ${already === 1 ? 'is' : 'are'} already in your cart — skipped`);
+    }
 
     // Phase 1 — find the live articles.
     const batches = [];
     let n = 0;
-    for (const [seller, targets] of bySeller) {
+    const todoSellers = [...bySeller].filter(([, ts]) => ts.size);
+    for (const [seller, targets] of todoSellers) {
       if (aborted) break;
-      status(`Finding articles at ${seller} (${++n} of ${bySeller.size})…`, (n - 1) / bySeller.size * (dry ? 1 : 0.4));
+      status(`Finding articles at ${seller} (${++n} of ${todoSellers.length})…`, (n - 1) / todoSellers.length * (dry ? 1 : 0.4));
       try {
         const found = await collectSellerArticles(seller, wantlistId, targets);
         if (found.items.length) batches.push({ seller, ...found });
@@ -1265,50 +1309,53 @@
       return;
     }
 
-    // Phase 2 — send, verify against the real cart, retry singles.
-    let snap = await cartSnapshot();
-    if (!snap) {
-      out.innerHTML = '<div class="alert alert-danger">Could not read your cart, so nothing was sent. Are you logged in?</div>';
-      return;
-    }
-    const queue = batches.flatMap((b) => b.items.map((it) => ({ ...it, token: b.token })));
-    // If the cart page shows article ids at all, it shows the ones already in it.
-    let idsVisible = queue.some((it) => hasId(snap, it.id)) || null;
-    const already = idsVisible ? queue.filter((it) => hasId(snap, it.id)) : [];
-    let todo = queue.filter((it) => !already.includes(it));
+    // Phase 2 — send, then confirm each article's amount in the real cart.
+    // Each item knows the amount the cart must reach; an item is only ever
+    // re-sent after the cart has had several seconds to show it.
+    const queue = batches.flatMap((b) => b.items.map((it) => ({
+      ...it, token: b.token, expect: amountOf(snap, it.id) + it.qty,
+    })));
     const added = [];
     const failed = [];
-    const totalSend = todo.length || 1;
+    const totalSend = queue.length || 1;
     let route = null;
+    let byId = snap.arts.size > 0 || null;    // learned on the first add if the cart was empty
 
-    // Did these items land between two snapshots?
-    const landed = (before, after, items) => {
-      if (!after) return [];
-      if (idsVisible) return items.filter((it) => hasId(after, it.id));
-      return valueGrew(before, after) ? items : [];          // only used one at a time
+    const isIn = (s, it) => amountOf(s, it.id) >= it.expect;
+    // Post, then poll the cart until every item shows up or ~8s pass.
+    const sendAndConfirm = async (rt, items) => {
+      const before = snap;
+      await postCart(rt, items[0].token, items);
+      for (const wait of [1200, 1800, 2500, 3000]) {
+        await sleep(wait);
+        const now = await cartSnapshot();
+        if (!now) continue;
+        snap = now;
+        if (byId == null && now.arts.size) byId = true;
+        if (byId) { if (items.every((it) => isIn(now, it))) break; }
+        else if (valueGrew(before, now)) break;
+      }
+      if (byId) return items.filter((it) => isIn(snap, it));
+      return valueGrew(before, snap) ? items : [];
     };
 
-    // Calibrate on the first article: find the request shape, learn whether the
-    // cart page exposes ids (then we can batch), else go one at a time.
+    // Calibrate on the first article: find the request shape that works.
+    let todo = queue.slice();
     while (todo.length && !route && !aborted) {
       const it = todo[0];
       status(`Adding ${it.name}…`, 0.4);
       for (const rt of addRoutes()) {
-        await postCart(rt, it.token, [it]);
-        await sleep(1300);
-        const now = await cartSnapshot();
-        if (now && (hasId(now, it.id) || valueGrew(snap, now))) {
+        if ((await sendAndConfirm(rt, [it])).length) {
           route = rt;
           localStorage.setItem(ROUTE_KEY, rt.id);
-          if (idsVisible == null) idsVisible = hasId(now, it.id);
-          snap = now;
           break;
         }
-        if (now) snap = now;
-        await sleep(400);
+        // Did it land late after all? Then this shape works; do not resend.
+        const late = await cartSnapshot();
+        if (late) snap = late;
+        if (late && (byId ? isIn(late, it) : false)) { route = rt; localStorage.setItem(ROUTE_KEY, rt.id); break; }
       }
       if (!route) {
-        // Maybe this one article sold. Try the next before giving up entirely.
         failed.push(it);
         todo.shift();
         if (failed.length >= 3) break;
@@ -1317,62 +1364,79 @@
       added.push(it);
       todo.shift();
     }
-    // Gave up after three refusals in a row. If nothing ever landed, the
-    // request itself is wrong; otherwise those articles are simply gone.
-    if (!route && todo.length && !already.length) {
+    if (!route && todo.length && !added.length) {
       out.innerHTML = `<div class="alert alert-danger"><strong>Could not add to the cart automatically</strong> —
         none of the request shapes changed your cart. Nothing was bought.
         <div class="mt-2">Use <em>Copy list</em> and the seller links below, or press <em>Diagnose cart</em> and send the output.</div></div>`;
       return;
     }
     if (!route) { failed.push(...todo); todo = []; }
-    if (route) log(`request shape: ${route.id}; verifying ${idsVisible ? 'by article id, in batches' : 'by cart value, one at a time'}`);
+    if (route) log(`request shape: ${route.id}; confirming ${byId ? 'each article in the cart' : 'by cart value, one at a time'}`);
 
-    const chunk = idsVisible ? CART_CHUNK : 1;
+    // One seller at a time, in small batches.
+    const chunk = byId ? CART_CHUNK : 1;
     const retry = [];
-    for (let i = 0; i < todo.length && !aborted; i += chunk) {
-      const part = todo.slice(i, i + chunk);
-      status(`Adding ${part[0].seller}: ${part.map((x) => x.name).join(', ')}`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
-      await postCart(route, part[0].token, part);
-      await sleep(1200);
-      const now = await cartSnapshot();
-      const ok = landed(snap, now, part);
+    for (let i = 0; i < todo.length && !aborted;) {
+      const seller = todo[i].seller;
+      let k = i;
+      while (k < todo.length && k - i < chunk && todo[k].seller === seller) k++;
+      const part = todo.slice(i, k);
+      i = k;
+      status(`Adding ${seller}: ${part.map((x) => x.name).join(', ')}`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
+      const ok = await sendAndConfirm(route, part);
       added.push(...ok);
       part.filter((x) => !ok.includes(x)).forEach((x) => retry.push(x));
-      if (now) snap = now;
       await sleep(jitter());
     }
 
-    // Second chance, one article per request, after a short pause.
+    // Second chance, one article per request — but only for what the cart
+    // still does not show after a further pause.
     if (retry.length && !aborted) {
-      log(`${retry.length} article${retry.length === 1 ? '' : 's'} did not register — retrying one by one`);
-      await sleep(2500);
-      for (const it of retry) {
+      await sleep(3000);
+      const now = await cartSnapshot();
+      if (now) snap = now;
+      const still = retry.filter((it) => {
+        if (byId && isIn(snap, it)) { added.push(it); return false; }
+        return true;
+      });
+      if (still.length) log(`${plural(still.length, 'article')} did not register — retrying one by one`);
+      for (const it of still) {
         if (aborted) break;
         status(`Retrying ${it.name} (${it.seller})…`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
-        await postCart(route, it.token, [it]);
-        await sleep(1500);
-        const now = await cartSnapshot();
-        if (landed(snap, now, [it]).length) added.push(it); else failed.push(it);
-        if (now) snap = now;
+        if ((await sendAndConfirm(route, [it])).length) added.push(it); else failed.push(it);
         await sleep(jitter());
       }
     }
 
+    // Anything in the cart beyond what this basket asks for — from an earlier
+    // run or added by hand — is pointed out rather than silently left.
+    const extra = [];
+    bySeller.forEach((targets, seller) => {
+      const keys = new Set();
+      snap.arts.forEach((a) => { if (a.seller.toLowerCase() === seller.toLowerCase()) keys.add(a.key); });
+      keys.forEach((key) => {
+        const want = r.lines[r.sellers.indexOf(seller)]?.filter((x) => m.wanted[x.i].key === key).length || 0;
+        const held = heldFor(snap, seller, key);
+        if (want && held > want) extra.push({ seller, name: m.wanted.find((w) => w.key === key)?.name || key, held, want });
+      });
+    });
+
     const units = (list) => list.reduce((a, it) => a + it.qty, 0);
     out.innerHTML = summaryHtml({
-      dry, wantedUnits, foundUnits, missedTargets, failed,
-      added: units(added), already: units(already), cart: snap,
+      dry, wantedUnits, foundUnits, missedTargets, failed, extra,
+      added: units(added), already, cart: snap,
     });
   }
 
-  function summaryHtml({ dry, wantedUnits, foundUnits, missedTargets, failed, added, already, cart }) {
+  function summaryHtml({ dry, wantedUnits, foundUnits, missedTargets, failed, added, already, cart, extra = [] }) {
     const rows = [
       ...missedTargets.map((x) => [x.name, x.seller, x.why === 'pricier'
         ? `<span class="badge text-bg-warning">price rose</span> now ${euro(x.price)}`
         : '<span class="badge text-bg-secondary">sold out</span> not on their pages any more']),
       ...failed.map((x) => [x.name, x.seller,
         '<span class="badge text-bg-danger">refused</span> Cardmarket did not accept it — likely just sold']),
+      ...extra.map((x) => [x.name, x.seller,
+        `<span class="badge text-bg-warning">too many</span> ${x.held} in your cart, this basket needs ${x.want} — lower it in the cart`]),
     ].map(([a, b, c]) => `<tr><td class="text-start">${esc(a)}</td><td class="text-start">${esc(b)}</td><td class="text-start">${c}</td></tr>`).join('');
     const short = missedTargets.reduce((a, x) => a + x.qty, 0) + failed.reduce((a, x) => a + x.qty, 0);
     const head = dry
@@ -1380,7 +1444,7 @@
       : `<strong>${added + already} of ${wantedUnits} cards are in your cart</strong>${already ? ` (${already} were already there)` : ''}.
          ${cart?.value != null ? `Cart value now ${euro(cart.value)}.` : ''}
          <a href="/${LANG_SEG}/${GAME_SEG}/ShoppingCart">Open the cart</a> to check shipping and place each order.`;
-    return `<div class="alert alert-${short ? 'warning' : 'success'} mb-2">${head}</div>
+    return `<div class="alert alert-${short || extra.length ? 'warning' : 'success'} mb-2">${head}</div>
       ${rows ? `<div class="table-responsive"><table class="table table-sm mb-0">
         <thead><tr><th class="text-start">Card</th><th class="text-start">Seller</th><th class="text-start">What happened</th></tr></thead>
         <tbody>${rows}</tbody></table></div>` : ''}`;
@@ -1430,9 +1494,13 @@
     }
 
     const snap = await cartSnapshot();
-    const ids = snap ? (snap.html.match(/idArticle\D{0,6}(\d{6,})/g) || []).length : 0;
     notes.push(`remembered request shape: ${localStorage.getItem(ROUTE_KEY) || 'none yet'}`);
-    notes.push(`cart: ${snap ? `value ${euro(snap.value)}, ${snap.html.length} chars, ~${ids} article-id mentions` : 'unreadable'}`);
+    if (snap) {
+      const units = [...snap.arts.values()].reduce((a, x) => a + x.amount, 0);
+      const doubles = [...snap.arts.values()].filter((x) => x.amount > 1).length;
+      notes.push(`cart: value ${euro(snap.value)}, ${snap.arts.size} articles, ${units} cards, ${doubles} with amount > 1`);
+      if (articleId) notes.push(`  article ${articleId} in cart: ${amountOf(snap, articleId)}`);
+    } else notes.push('cart: unreadable');
     console.log('[cmSSO] add-to-cart diagnostics\n' + notes.join('\n'));
     out.innerHTML = `<div class="alert alert-info">
       <strong>Add-to-cart diagnostics</strong>
@@ -1662,6 +1730,9 @@
               title="Open this seller's offers filtered to your list">${esc(m.sellerNames[j])}</a></strong>
             <span class="small text-muted">${line.length} · ${euro(line.reduce((a, x) => a + x.price, 0))} + ${euro(m.ship[j])}</span>
           </div>
+          ${line.length ? `<button type="button" data-act="add-seller" data-p="${p}"
+            class="btn btn-sm btn-outline-success py-0 mt-1" title="Add only this seller's cards to your cart">
+            <span class="fonticon-cart me-1"></span>Add ${plural(line.length, 'card')}</button>` : ''}
           <ul class="mb-0 ps-3 cmSSO-small mt-1">
             ${line.map((x) => `<li ${cardAttrs(m.wanted[x.i].name)}>${esc(m.wanted[x.i].name)} <span class="text-muted">${euro(x.price)}</span></li>`).join('') || '<li class="text-muted">nothing</li>'}
           </ul>
@@ -1982,22 +2053,30 @@
       return;
     }
 
-    if (act === 'add' || act === 'check' || act === 'diag') {
-      if (act === 'add') {
-        const n = r.lines.reduce((a, l) => a + l.length, 0);
-        if (!confirm(`Add ${n} cards from ${r.sellers.length} seller${r.sellers.length === 1 ? '' : 's'} to your Cardmarket cart?\n\n`
+    if (act === 'add' || act === 'add-seller' || act === 'check' || act === 'diag') {
+      // One seller's part of the basket, added on its own.
+      let target = r;
+      if (act === 'add-seller') {
+        const p = +actEl.getAttribute('data-p');
+        target = { ...r, idx: [r.idx[p]], sellers: [r.sellers[p]], lines: [r.lines[p]] };
+      }
+      if (act === 'add' || act === 'add-seller') {
+        const n = target.lines.reduce((a, l) => a + l.length, 0);
+        const who = target.sellers.length === 1 ? target.sellers[0] : `${target.sellers.length} sellers`;
+        if (!confirm(`Add ${n} cards from ${who} to your Cardmarket cart?\n\n`
           + 'This does not buy anything — you review each order in the cart before checkout. '
-          + 'Articles already in your cart are detected and skipped.')) return;
+          + 'Cards already in your cart count towards the basket and are not added again.')) return;
       }
       STATE.busy = true;
       const hero = document.querySelector('#cmSSO-results .cmSSO-hero');
-      const btns = hero ? [...hero.querySelectorAll('button[data-act]:not([data-act="stop"])')] : [];
+      const btns = [...document.querySelectorAll('#cmSSO-results button[data-act="add"], #cmSSO-results button[data-act="add-seller"], '
+        + '#cmSSO-results button[data-act="check"], #cmSSO-results button[data-act="diag"], #cmSSO-results button[data-act="copy"]')];
       const stop = hero?.querySelector('[data-act="stop"]');
       btns.forEach((b) => { b.disabled = true; });
       if (stop && act !== 'diag') stop.hidden = false;
       try {
         if (act === 'diag') await diagnoseCart(m, r);
-        else await addBasketToCart(m, r, { dryRun: act === 'check' });
+        else await addBasketToCart(m, target, { dryRun: act === 'check' });
       } catch (err) {
         const out = document.querySelector('#cmSSO-cart-out');
         if (out) out.innerHTML = `<div class="alert alert-danger">Stopped: ${esc(err.message)}</div>`;
@@ -2193,7 +2272,7 @@
       .replace(/(value=["'])[^"']*(["'][^>]*name=["']__cmtkn)/gi, '$1REDACTED$2')
       .replace(/("__cmtkn"\s*:\s*")[^"]*/g, '$1REDACTED');
 
-    const out = { saved: new Date().toISOString(), script: '2.4.0', listId, seller, pages: {},
+    const out = { saved: new Date().toISOString(), script: '2.4.1', listId, seller, pages: {},
       renderedWizard: scrub(document.documentElement.outerHTML) };
     for (const [name, url] of pages) {
       ui.note(`Saving ${name}…`);
