@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.4.1
+// @version      2.4.2
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard*
@@ -1097,10 +1097,32 @@
         },
         body: body.toString(),
       });
-      return { ok: res.ok, status: res.status };
+      return { ok: res.ok, status: res.status, ...parseAjaxReply(await res.text().catch(() => '')) };
     } catch (e) {
-      return { ok: false, status: 0 };
+      return { ok: false, status: 0, xml: false, type: '', messages: [] };
     }
+  }
+
+  /*
+   * Cardmarket answers with <ajaxResponse>: resultType and systemMessage are
+   * base64; the message lists each refused article as "<name or id> => why".
+   * resultType says "error" for the whole request even when only one article
+   * was refused and the rest landed, so it is not used as the verdict.
+   */
+  function parseAjaxReply(text) {
+    if (!/<ajaxResponse/i.test(text)) return { xml: false, type: '', messages: [] };
+    const b64 = (v) => {
+      try { return new TextDecoder().decode(Uint8Array.from(atob(v || ''), (c) => c.charCodeAt(0))); } catch { return v || ''; }
+    };
+    const xml = new DOMParser().parseFromString(text, 'text/xml');
+    const type = b64(xml.querySelector('resultType')?.textContent);
+    const html = new DOMParser().parseFromString(b64(xml.querySelector('systemMessage')?.textContent), 'text/html');
+    const messages = [...html.querySelectorAll('.alert-body p, .alert-body li')].map((el) => {
+      const t = el.textContent.trim();
+      const at = t.indexOf(' => ');
+      return at < 0 ? { who: '', text: t } : { who: t.slice(0, at).trim(), text: t.slice(at + 4).trim() };
+    }).filter((x) => x.who);
+    return { xml: true, type, messages };
   }
 
   /*
@@ -1133,7 +1155,6 @@
   }
 
   const amountOf = (snap, id) => snap?.arts.get(String(id))?.amount || 0;
-  const valueGrew = (a, b) => !!a && !!b && a.value != null && b.value != null && b.value > a.value + 0.001;
   // Copies of a card already in the cart from one seller, whichever article.
   function heldFor(snap, seller, key) {
     let n = 0;
@@ -1162,7 +1183,7 @@
           return;
         }
         const m = cands.get(key) || new Map();
-        m.set(r.articleId, { id: r.articleId, price: r.price, count: Math.max(1, r.count) });
+        m.set(r.articleId, { id: r.articleId, price: r.price, count: Math.max(1, r.count), rowName: r.name });
         cands.set(key, m);
       });
       return rows;
@@ -1221,7 +1242,7 @@
       for (const c of list) {
         if (need <= 0) break;
         const q = Math.min(need, c.count);
-        items.push({ id: c.id, qty: q, price: c.price, name: t.name, seller });
+        items.push({ id: c.id, qty: q, price: c.price, name: t.name, rowName: c.rowName, key, seller });
         need -= q;
         t.got += q;
       }
@@ -1309,101 +1330,111 @@
       return;
     }
 
-    // Phase 2 — send, then confirm each article's amount in the real cart.
-    // Each item knows the amount the cart must reach; an item is only ever
-    // re-sent after the cart has had several seconds to show it.
-    const queue = batches.flatMap((b) => b.items.map((it) => ({
-      ...it, token: b.token, expect: amountOf(snap, it.id) + it.qty,
-    })));
+    // Phase 2 — send, then confirm in the real cart.
+    //
+    // A cart line gets a NEW article id when it lands (the offer's id is not
+    // what the cart shows), so landing is checked by seller + card: each item
+    // knows how many copies of its card that seller's cart section must hold.
+    // Cardmarket's own reply also names every refused article and why.
+    const expectSoFar = new Map();
+    const queue = batches.flatMap((b) => b.items.map((it) => {
+      const k = `${b.seller.toLowerCase()}|${it.key}`;
+      const base = expectSoFar.has(k) ? expectSoFar.get(k) : heldFor(snap, b.seller, it.key);
+      expectSoFar.set(k, base + it.qty);
+      return { ...it, token: b.token, expect: base + it.qty };
+    }));
     const added = [];
     const failed = [];
     const totalSend = queue.length || 1;
     let route = null;
-    let byId = snap.arts.size > 0 || null;    // learned on the first add if the cart was empty
 
-    const isIn = (s, it) => amountOf(s, it.id) >= it.expect;
-    // Post, then poll the cart until every item shows up or ~8s pass.
+    const isIn = (s, it) => heldFor(s, it.seller, it.key) >= it.expect;
+    // Post once, read the refusals from the reply, then poll the cart until
+    // every other item shows up or ~8s pass. Never re-posts by itself.
     const sendAndConfirm = async (rt, items) => {
-      const before = snap;
-      await postCart(rt, items[0].token, items);
-      for (const wait of [1200, 1800, 2500, 3000]) {
-        await sleep(wait);
-        const now = await cartSnapshot();
-        if (!now) continue;
-        snap = now;
-        if (byId == null && now.arts.size) byId = true;
-        if (byId) { if (items.every((it) => isIn(now, it))) break; }
-        else if (valueGrew(before, now)) break;
+      const res = await postCart(rt, items[0].token, items);
+      const refused = new Map();
+      items.forEach((it) => {
+        const why = res.messages.find((x) => x.who === String(it.id) || normName(x.who) === normName(it.rowName || it.name));
+        if (why) refused.set(it, why.text);
+      });
+      const pending = items.filter((it) => !refused.has(it));
+      if (res.xml && pending.length) {
+        for (const wait of [1200, 1800, 2500, 3000]) {
+          await sleep(wait);
+          const now = await cartSnapshot();
+          if (!now) continue;
+          snap = now;
+          if (pending.every((it) => isIn(now, it))) break;
+        }
       }
-      if (byId) return items.filter((it) => isIn(snap, it));
-      return valueGrew(before, snap) ? items : [];
+      const ok = pending.filter((it) => isIn(snap, it));
+      // A refusal for a card that landed anyway (say one copy of two) still counts.
+      refused.forEach((why, it) => { if (isIn(snap, it)) { ok.push(it); refused.delete(it); } });
+      return { res, ok, refused };
     };
+    const refuse = (it, why) => { it.why = why; failed.push(it); };
 
-    // Calibrate on the first article: find the request shape that works.
+    // Find the request shape on the first article. A shape is right when it
+    // returns Cardmarket's ajaxResponse, whether or not that article was
+    // accepted, so no article is ever sent down two shapes.
     let todo = queue.slice();
+    let first = null;
     while (todo.length && !route && !aborted) {
-      const it = todo[0];
+      const it = todo.shift();
       status(`Adding ${it.name}…`, 0.4);
       for (const rt of addRoutes()) {
-        if ((await sendAndConfirm(rt, [it])).length) {
-          route = rt;
-          localStorage.setItem(ROUTE_KEY, rt.id);
-          break;
-        }
-        // Did it land late after all? Then this shape works; do not resend.
-        const late = await cartSnapshot();
-        if (late) snap = late;
-        if (late && (byId ? isIn(late, it) : false)) { route = rt; localStorage.setItem(ROUTE_KEY, rt.id); break; }
+        const r1 = await sendAndConfirm(rt, [it]);
+        if (!r1.res.xml) { log(`${rt.id}: HTTP ${r1.res.status}, not Cardmarket's add-to-cart reply`); continue; }
+        route = rt;
+        localStorage.setItem(ROUTE_KEY, rt.id);
+        if (r1.ok.length) added.push(it);
+        else if (r1.refused.has(it)) refuse(it, r1.refused.get(it));
+        else first = it;               // answered, cart not showing it yet: checked again below
+        break;
       }
-      if (!route) {
-        failed.push(it);
-        todo.shift();
-        if (failed.length >= 3) break;
-        continue;
-      }
-      added.push(it);
-      todo.shift();
+      if (!route) { refuse(it, 'no request shape was accepted'); break; }
     }
-    if (!route && todo.length && !added.length) {
+    if (!route) {
       out.innerHTML = `<div class="alert alert-danger"><strong>Could not add to the cart automatically</strong> —
-        none of the request shapes changed your cart. Nothing was bought.
-        <div class="mt-2">Use <em>Copy list</em> and the seller links below, or press <em>Diagnose cart</em> and send the output.</div></div>`;
+        Cardmarket did not answer any of the request shapes. Nothing was bought.
+        <div class="mt-2">Use the per-seller buttons, <em>Copy list</em>, or press <em>Diagnose cart</em> and send the output.</div></div>`;
       return;
     }
-    if (!route) { failed.push(...todo); todo = []; }
-    if (route) log(`request shape: ${route.id}; confirming ${byId ? 'each article in the cart' : 'by cart value, one at a time'}`);
 
     // One seller at a time, in small batches.
-    const chunk = byId ? CART_CHUNK : 1;
-    const retry = [];
+    const retry = first ? [first] : [];
     for (let i = 0; i < todo.length && !aborted;) {
       const seller = todo[i].seller;
       let k = i;
-      while (k < todo.length && k - i < chunk && todo[k].seller === seller) k++;
+      while (k < todo.length && k - i < CART_CHUNK && todo[k].seller === seller) k++;
       const part = todo.slice(i, k);
       i = k;
       status(`Adding ${seller}: ${part.map((x) => x.name).join(', ')}`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
-      const ok = await sendAndConfirm(route, part);
-      added.push(...ok);
-      part.filter((x) => !ok.includes(x)).forEach((x) => retry.push(x));
+      const r1 = await sendAndConfirm(route, part);
+      added.push(...r1.ok);
+      r1.refused.forEach((why, it) => refuse(it, why));
+      part.filter((x) => !r1.ok.includes(x) && !r1.refused.has(x)).forEach((x) => retry.push(x));
       await sleep(jitter());
     }
 
-    // Second chance, one article per request — but only for what the cart
-    // still does not show after a further pause.
+    // Second chance, one article per request: only for what Cardmarket did
+    // not refuse and the cart still does not show after a further pause.
     if (retry.length && !aborted) {
       await sleep(3000);
       const now = await cartSnapshot();
       if (now) snap = now;
       const still = retry.filter((it) => {
-        if (byId && isIn(snap, it)) { added.push(it); return false; }
+        if (isIn(snap, it)) { added.push(it); return false; }
         return true;
       });
       if (still.length) log(`${plural(still.length, 'article')} did not register — retrying one by one`);
       for (const it of still) {
         if (aborted) break;
         status(`Retrying ${it.name} (${it.seller})…`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
-        if ((await sendAndConfirm(route, [it])).length) added.push(it); else failed.push(it);
+        const r1 = await sendAndConfirm(route, [it]);
+        if (r1.ok.length) added.push(it);
+        else refuse(it, r1.refused.get(it) || 'did not appear in your cart');
         await sleep(jitter());
       }
     }
@@ -1434,7 +1465,7 @@
         ? `<span class="badge text-bg-warning">price rose</span> now ${euro(x.price)}`
         : '<span class="badge text-bg-secondary">sold out</span> not on their pages any more']),
       ...failed.map((x) => [x.name, x.seller,
-        '<span class="badge text-bg-danger">refused</span> Cardmarket did not accept it — likely just sold']),
+        `<span class="badge text-bg-danger">refused</span> ${esc(x.why || 'Cardmarket did not accept it — likely just sold')}`]),
       ...extra.map((x) => [x.name, x.seller,
         `<span class="badge text-bg-warning">too many</span> ${x.held} in your cart, this basket needs ${x.want} — lower it in the cart`]),
     ].map(([a, b, c]) => `<tr><td class="text-start">${esc(a)}</td><td class="text-start">${esc(b)}</td><td class="text-start">${c}</td></tr>`).join('');
@@ -2272,7 +2303,7 @@
       .replace(/(value=["'])[^"']*(["'][^>]*name=["']__cmtkn)/gi, '$1REDACTED$2')
       .replace(/("__cmtkn"\s*:\s*")[^"]*/g, '$1REDACTED');
 
-    const out = { saved: new Date().toISOString(), script: '2.4.1', listId, seller, pages: {},
+    const out = { saved: new Date().toISOString(), script: '2.4.2', listId, seller, pages: {},
       renderedWizard: scrub(document.documentElement.outerHTML) };
     for (const [name, url] of pages) {
       ui.note(`Saving ${name}…`);
