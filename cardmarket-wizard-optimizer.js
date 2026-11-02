@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.2.0
+// @version      2.2.1
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard/Results/*
@@ -367,23 +367,6 @@
     return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  function wantedFromText(text) {
-    const map = new Map();
-    text.split(/\r?\n/).forEach((raw) => {
-      const line = raw.trim();
-      if (!line || line.startsWith('//') || line.startsWith('#')) return;
-      const m = line.match(/^(\d+)\s*[xX]?\s+(.*)$/);
-      const qty = m ? parseInt(m[1], 10) : 1;
-      let name = (m ? m[2] : line).replace(/\s*\([A-Za-z0-9]{2,6}\)\s*\d*\s*$/, '').trim();
-      if (!name) return;
-      const key = normName(name);
-      const cur = map.get(key) || { key, name: searchableName(name), qty: 0, wizardPrice: null };
-      cur.qty += qty;
-      map.set(key, cur);
-    });
-    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
-  }
-
   function wantlistsFromDoc(doc) {
     const seen = new Set();
     const out = [];
@@ -440,25 +423,6 @@
     }
     const doc = await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Wants`);
     return wantlistsFromDoc(doc);
-  }
-
-  async function fetchWantlist(id) {
-    const doc = await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Wants/${id}`);
-    const map = new Map();
-    const rows = [...doc.querySelectorAll('[id^="wantsRow"], .table-body .row, tbody tr')];
-    rows.forEach((row) => {
-      const link = row.querySelector('a[href*="/Products/"]');
-      if (!link) return;
-      const name = link.textContent.trim();
-      if (!name) return;
-      const amtInput = row.querySelector('input[name*="amount" i], input[name*="Amount" i]');
-      const qty = amtInput ? (parseInt(amtInput.value, 10) || 1) : 1;
-      const key = normName(name);
-      const cur = map.get(key) || { key, name: searchableName(name), qty: 0, wizardPrice: null };
-      cur.qty += qty;
-      map.set(key, cur);
-    });
-    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
 
   /*
@@ -958,18 +922,11 @@
         </p>
 
         <div class="row g-2 align-items-end">
-          <div class="col-12 col-md-5">
+          <div class="col-12 col-md-7">
             <label class="form-label mb-1 small" for="cmSSO-wantlist">Wants list this wizard run used</label>
             <select id="cmSSO-wantlist" class="form-select form-select-sm"><option value="">Loading your lists…</option></select>
           </div>
-          <div class="col-12 col-md-3">
-            <label class="form-label mb-1 small" for="cmSSO-source">Cards to price</label>
-            <select id="cmSSO-source" class="form-select form-select-sm">
-              <option value="wizard">From these results</option>
-              <option value="wantlist">Everything on the list</option>
-            </select>
-          </div>
-          <div class="col-12 col-md-4 d-flex gap-2">
+          <div class="col-12 col-md-5 d-flex gap-2">
             <button id="cmSSO-run" type="button" class="btn btn-primary btn-sm flex-grow-1"><span class="fonticon-wand me-2"></span>Scan sellers</button>
             <button id="cmSSO-stop" type="button" class="btn btn-outline-danger btn-sm" hidden>Stop</button>
             <button id="cmSSO-reanalyse" type="button" class="btn btn-outline-primary btn-sm" hidden>Last scan</button>
@@ -1985,17 +1942,10 @@
 
     try {
       // 1. Wanted cards
-      const source = panel.querySelector('#cmSSO-source').value;
-      let wanted;
+      // The cards are the ones this wizard run placed; the wants list is only
+      // used to filter each seller's offers down to them.
+      const wanted = wantedFromWizard(wiz);
       const wantlistId = panel.querySelector('#cmSSO-wantlist').value || null;
-      if (source === 'wantlist') {
-        if (!wantlistId) { ui.note('Pick a wants list first.', 'warn'); return; }
-        ui.progress(0, 1, 'Reading wants list…');
-        wanted = await fetchWantlist(wantlistId);
-        if (!wanted.length) { ui.note('Could not read that wants list.', 'warn'); return; }
-      } else {
-        wanted = wantedFromWizard(wiz);
-      }
       if (!wanted.length) { ui.note('No cards to look for.', 'warn'); return; }
 
       const fast = !!wantlistId;
@@ -2173,8 +2123,12 @@
             + lists.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join('')
           : '<option value="">No wants lists found</option>';
         // Newest list first is usually the one the wizard was just run on.
+        // Prefer a wants list this page links to; else the newest list.
+        const linked = [...document.querySelectorAll('a[href*="/Wants/"]')]
+          .map((a) => ((a.getAttribute('href') || '').match(/\/Wants\/(\d+)(?:[/?#]|$)/) || [])[1])
+          .find((id) => id && lists.some((l) => l.id === id));
         const newest = lists.slice().sort((a, b) => Number(b.id) - Number(a.id))[0];
-        if (newest) sel.value = newest.id;
+        if (linked) sel.value = linked; else if (newest) sel.value = newest.id;
       } catch {
         sel.innerHTML = '<option value="">Could not load your wants lists</option>';
         ui.note('Could not read your wants lists. Reload the page, or scan without one (slower).', 'warn');
