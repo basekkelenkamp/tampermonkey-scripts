@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.3.0
+// @version      2.4.0
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard*
@@ -268,6 +268,35 @@
   const offerAllowed = (o) => !o.playset;
 
   /*
+   * Card images, for the hover preview. Cardmarket keeps a card's picture in
+   * a tooltip attribute holding an <img> (wizard rows, wants list rows, search
+   * results), so read the src out of whichever attribute carries one.
+   */
+  const CARD_IMG = new Map();      // card key -> image url
+  const absUrl = (u) => (u.startsWith('//') ? `https:${u}` : u);
+  function imageIn(el) {
+    if (!el) return null;
+    for (const n of [el, ...el.querySelectorAll('*')]) {
+      for (const a of n.attributes) {
+        if (a.value.indexOf('<img') === -1) continue;
+        const m = a.value.match(/src=["']([^"']+)["']/);
+        if (m) return absUrl(m[1]);
+      }
+      if (n.tagName === 'IMG') {
+        const src = n.getAttribute('data-src') || n.getAttribute('src') || '';
+        if (/product-images|\/items\//i.test(src)) return absUrl(src);
+      }
+    }
+    // Lazy-loaded thumbnails keep the url in other attributes; take the first.
+    const m = el.outerHTML.match(/(?:https?:)?\/\/product-images\.s3\.cardmarket\.com\/[^"'\s&<>]+?\.(?:jpe?g|png|webp)/i);
+    return m ? absUrl(m[0]) : null;
+  }
+  const rememberImage = (name, url) => {
+    const key = normName(name);
+    if (key && url && !CARD_IMG.has(key)) CARD_IMG.set(key, url);
+  };
+
+  /*
    * Parsing: the wizard results page
    */
 
@@ -296,8 +325,10 @@
 
       let articles = [...card.querySelectorAll('table tbody tr')].map((tr) => {
         const tds = tr.querySelectorAll('td');
+        const name = tr.querySelector('.card-name')?.textContent.trim() || '';
+        rememberImage(name, imageIn(tr));
         return {
-          name: tr.querySelector('.card-name')?.textContent.trim() || '',
+          name,
           qty: parseInt(tds[2]?.textContent.trim(), 10) || 1,
           price: parsePrice(tds[tds.length - 1]?.textContent),
         };
@@ -388,7 +419,7 @@
       table.querySelectorAll('tbody tr').forEach((tr) => {
         const td = tr.children[col];
         const name = td ? td.textContent.trim() : '';
-        if (name) keys.add(normName(name));
+        if (name) { keys.add(normName(name)); rememberImage(name, imageIn(tr)); }
       });
     }
     const name = (doc.title || '').split('|')[0].trim() || `Wants list ${id}`;
@@ -919,6 +950,15 @@
       #cmSSO .cmSSO-k { min-width: 6rem; line-height: 1.15; }
       #cmSSO .cmSSO-k small { display: block; font-size: .75rem; opacity: .85; }
       #cmSSO tr[data-single] { cursor: pointer; }
+      #cmSSO #cmSSO-cards > summary { list-style: none; background: var(--bs-primary-bg-subtle, #e7f1ff); }
+      #cmSSO #cmSSO-cards > summary::-webkit-details-marker { display: none; }
+      #cmSSO #cmSSO-cards > summary:hover { filter: brightness(.97); }
+      #cmSSO .cmSSO-chev { display: inline-block; transition: transform .15s; }
+      #cmSSO #cmSSO-cards[open] .cmSSO-chev { transform: rotate(90deg); }
+      #cmSSO [data-ck] { cursor: default; }
+      #cmSSO-preview { position: fixed; z-index: 2000; width: 240px; pointer-events: none;
+        border-radius: 11px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.35); background: #222; }
+      #cmSSO-preview img { display: block; width: 100%; height: auto; }
     `;
     document.head.appendChild(css);
   }
@@ -1401,6 +1441,76 @@
   }
 
   /*
+   * Hover preview: any element with data-ck (card key) and data-cn (name)
+   * shows that card. Images come from the wizard rows and the wants list;
+   * a card neither had is looked up once via Cardmarket's search.
+   */
+  const imgLookups = new Map();
+  function imageFor(key, name) {
+    if (CARD_IMG.has(key)) return Promise.resolve(CARD_IMG.get(key));
+    if (!imgLookups.has(key)) {
+      imgLookups.set(key, (async () => {
+        try {
+          const res = await fetch(`${location.origin}/${LANG_SEG}/${GAME_SEG}/Products/Search?searchString=${encodeURIComponent(searchableName(name))}`,
+            { credentials: 'same-origin' });
+          if (!res.ok) return null;
+          const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+          // The result row named exactly like the card, else the first result.
+          const exact = [...doc.querySelectorAll('a[href*="/Products/Singles/"]')]
+            .find((a) => normName(a.textContent) === key);
+          const row = exact?.closest('.row, tr, [id^="productRow"]');
+          const url = imageIn(row) || imageIn(doc.querySelector('main') || doc.body);
+          if (url) CARD_IMG.set(key, url);
+          return url;
+        } catch { return null; }
+      })());
+    }
+    return imgLookups.get(key);
+  }
+
+  function installPreview(root) {
+    let box = document.querySelector('#cmSSO-preview');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'cmSSO-preview';
+      box.hidden = true;
+      box.innerHTML = '<img alt="">';
+      document.body.appendChild(box);
+    }
+    const img = box.querySelector('img');
+    let current = null;
+    let last = { x: 0, y: 0 };
+    const place = () => {
+      const w = box.offsetWidth || 240, h = box.offsetHeight || 335, pad = 16;
+      let x = last.x + pad, y = last.y - h / 2;
+      if (x + w > innerWidth - 8) x = last.x - w - pad;
+      y = Math.max(8, Math.min(y, innerHeight - h - 8));
+      box.style.left = `${Math.max(8, x)}px`;
+      box.style.top = `${y}px`;
+    };
+    root.addEventListener('mouseover', async (e) => {
+      const el = e.target.closest('[data-ck]');
+      if (!el || el === current) return;
+      current = el;
+      last = { x: e.clientX, y: e.clientY };
+      const url = await imageFor(el.getAttribute('data-ck'), el.getAttribute('data-cn') || '');
+      if (current !== el || !url) return;
+      if (img.getAttribute('src') !== url) img.src = url;
+      box.hidden = false;
+      place();
+    });
+    root.addEventListener('mousemove', (e) => {
+      last = { x: e.clientX, y: e.clientY };
+      if (!box.hidden) place();
+    });
+    root.addEventListener('mouseout', (e) => {
+      const el = e.target.closest('[data-ck]');
+      if (el && !el.contains(e.relatedTarget)) { current = null; box.hidden = true; }
+    });
+  }
+  const cardAttrs = (name) => `data-ck="${esc(normName(name))}" data-cn="${esc(name)}"`;
+
+  /*
    * Rendering helpers
    */
 
@@ -1408,7 +1518,7 @@
     return `<a href="/${LANG_SEG}/${GAME_SEG}/Users/${encodeURIComponent(s)}/Offers/Singles" target="_blank" rel="noopener">${esc(s)}</a>`;
   }
   function cardSearchLink(name) {
-    return `<a href="/${LANG_SEG}/${GAME_SEG}/Products/Search?searchString=${encodeURIComponent(name)}" target="_blank" rel="noopener">${esc(name)}</a>`;
+    return `<a href="/${LANG_SEG}/${GAME_SEG}/Products/Search?searchString=${encodeURIComponent(name)}" target="_blank" rel="noopener" ${cardAttrs(name)}>${esc(name)}</a>`;
   }
   function gapList(m, gaps, limit = 60) {
     if (!gaps.length) return '<span class="text-success">nothing missing</span>';
@@ -1505,8 +1615,7 @@
           <button type="button" data-act="diag" class="btn btn-sm btn-link text-muted ms-auto">Diagnose cart</button>
         </div>
         <div id="cmSSO-cart-out" class="mt-2"></div>
-      </div>
-      <div id="cmSSO-detail"></div>`;
+      </div>`;
   }
 
   function showBasket(r) {
@@ -1554,7 +1663,7 @@
             <span class="small text-muted">${line.length} · ${euro(line.reduce((a, x) => a + x.price, 0))} + ${euro(m.ship[j])}</span>
           </div>
           <ul class="mb-0 ps-3 cmSSO-small mt-1">
-            ${line.map((x) => `<li>${esc(m.wanted[x.i].name)} <span class="text-muted">${euro(x.price)}</span></li>`).join('') || '<li class="text-muted">nothing</li>'}
+            ${line.map((x) => `<li ${cardAttrs(m.wanted[x.i].name)}>${esc(m.wanted[x.i].name)} <span class="text-muted">${euro(x.price)}</span></li>`).join('') || '<li class="text-muted">nothing</li>'}
           </ul>
         </div></div>`;
     }).join('');
@@ -1628,7 +1737,7 @@
       const worth = cost && cost.saving > 0.01;
       return {
         st, off, sort: worth ? cost.saving : -1,
-        html: `<tr class="${off ? 'text-muted' : ''}" data-name="${esc(st.w.key)}">
+        html: `<tr class="${off ? 'text-muted' : ''}" data-name="${esc(st.w.key)}" ${cardAttrs(st.w.name)}>
           <td class="text-start"><div class="form-check mb-0">
             <input class="form-check-input" type="checkbox" data-card="${esc(st.w.key)}" id="cmSSO-cx-${n}" ${off ? '' : 'checked'}>
             <label class="form-check-label" for="cmSSO-cx-${n}">${esc(st.w.name)}${st.w.qty > 1 ? ` ×${st.w.qty}` : ''}</label>
@@ -1647,12 +1756,21 @@
 
     const off = stats.filter((st) => excluded.has(st.w.key)).length;
     const lonely = stats.filter((st) => st.sellers === 1 && !excluded.has(st.w.key)).length;
+    const top = rows[0] && rows[0].sort > 0 ? rows[0] : null;
+    const topCost = top ? costOfCard(m, search, m.wanted.findIndex((x) => x.key === top.st.w.key)) : null;
 
     return `
-      <details id="cmSSO-cards" class="mb-2" ${cardsOpen ? 'open' : ''}>
-        <summary><strong>Cards: ${stats.length - off} of ${stats.length} included</strong>
-          ${off ? `<span class="text-muted"> · ${off} parked</span>` : ''}
-          <span class="text-muted small"> · untick a maybe and everything recalculates</span></summary>
+      <details id="cmSSO-cards" class="mb-3 border border-primary rounded" ${cardsOpen ? 'open' : ''}>
+        <summary class="p-2 d-flex flex-wrap align-items-center gap-2">
+          <span class="cmSSO-chev text-primary">▸</span>
+          <strong class="text-primary">Choose which cards to buy</strong>
+          <span class="badge text-bg-primary">${stats.length - off} of ${stats.length} included</span>
+          ${off ? `<span class="badge text-bg-secondary">${off} parked</span>` : ''}
+          <span class="small text-muted w-100 ps-4">
+            ${topCost ? `Dropping <strong>${esc(top.st.w.name)}</strong> alone saves <strong class="text-success">${euro(topCost.saving)}</strong>${topCost.fewerParcels > 0 ? ` and ${plural(topCost.fewerParcels, 'parcel')}` : ''}. ` : ''}
+            Untick the maybes and every price above recalculates instantly.</span>
+        </summary>
+        <div class="px-2 pb-2">
         <div class="d-flex flex-wrap gap-2 my-2 align-items-center">
           <input type="search" class="form-control form-control-sm" id="cmSSO-cardfilter" placeholder="Find a card…"
             style="max-width:14rem" value="${esc(cardFilter)}">
@@ -1673,6 +1791,7 @@
             </tr></thead>
             <tbody>${rows.map((r) => r.html).join('')}</tbody>
           </table>
+        </div>
         </div>
       </details>`;
   }
@@ -1798,8 +1917,9 @@
     results.innerHTML = `
       <hr>
       ${renderHero(m, search)}
-      ${renderInsights(m, search, wiz, singles)}
       ${renderCards(m, search, stats)}
+      <div id="cmSSO-detail"></div>
+      ${renderInsights(m, search, wiz, singles)}
       ${renderSingles(m, wiz, singles)}
       <p class="small text-muted mt-3 mb-0">
         ${wiz.wizardTotal != null ? `Wizard: ${euro(wiz.wizardTotal)}${wiz.wizardCards != null ? ` (${euro(wiz.wizardCards)} cards + ${euro(wiz.wizardShipping)} shipping${wiz.wizardShipments ? `, ${plural(wiz.wizardShipments, 'parcel')}` : ''})` : ''}. ` : ''}
@@ -2073,7 +2193,7 @@
       .replace(/(value=["'])[^"']*(["'][^>]*name=["']__cmtkn)/gi, '$1REDACTED$2')
       .replace(/("__cmtkn"\s*:\s*")[^"]*/g, '$1REDACTED');
 
-    const out = { saved: new Date().toISOString(), script: '2.3.0', listId, seller, pages: {},
+    const out = { saved: new Date().toISOString(), script: '2.4.0', listId, seller, pages: {},
       renderedWizard: scrub(document.documentElement.outerHTML) };
     for (const [name, url] of pages) {
       ui.note(`Saving ${name}…`);
@@ -2111,6 +2231,7 @@
     injectStyles();
     const panel = buildPanel(wiz);
     panel.querySelector('#cmSSO-results').addEventListener('click', onResultsClick);
+    installPreview(panel.querySelector('#cmSSO-results'));
 
     const info = panel.querySelector('#cmSSO-wantlist');
     wantlistReady = (async () => {
