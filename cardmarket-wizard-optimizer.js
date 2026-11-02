@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.1.0
+// @version      2.2.0
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard/Results/*
@@ -19,6 +19,9 @@
  * 3. Scores line-ups as COMPLETE ORDERS — a basket is extended until it covers
  *    every reachable card, else it looks cheap by omitting expensive ones.
  * 4. Parking a card recalculates instantly from the stored scan.
+ * 5. Add to cart finds the live articles (wants pages, then by name), sends
+ *    them in small batches, verifies each against your real cart and retries
+ *    anything that did not land, reporting it by name.
  *
  * Politeness: randomised delay, backoff on 429/503, a hard stop when blocked, and a
  * local cache so re-runs and re-analysis cost nothing.
@@ -631,26 +634,19 @@
     }
 
     /*
-     * Scoring needs numbers only, so flatten into a price grid: one row per copy
-     * of a card, one column per seller. Far cheaper than rebuilding per-seller
-     * shopping lists for every combination tried.
+     * Scoring needs numbers only. Single copies (the usual case) get a flat
+     * card x seller grid of cheapest prices; cards wanted more than once are
+     * merged across the chosen sellers, so two copies can come from two
+     * different sellers.
      */
-    const slotCard = [];
-    for (let i = 0; i < W; i++) for (let c = 0; c < wanted[i].qty; c++) slotCard.push(i);
-    const nSlots = slotCard.length;
-    const priceMat = new Float64Array(nSlots * S).fill(Infinity);
-    const slotOK = new Uint8Array(nSlots);
-    let si = 0;
+    const first = new Float64Array(W * S).fill(Infinity);
+    const multi = [];
     for (let i = 0; i < W; i++) {
-      for (let c = 0; c < wanted[i].qty; c++, si++) {
-        let any = 0;
-        for (let j = 0; j < S; j++) {
-          const u = units[i][j];
-          if (u.length > c) { priceMat[si * S + j] = u[c]; any = 1; }
-        }
-        slotOK[si] = any;
-      }
+      for (let j = 0; j < S; j++) if (units[i][j].length) first[i * S + j] = units[i][j][0];
+      if (wanted[i].qty > 1) multi.push(i);
     }
+    const isMulti = new Uint8Array(W);
+    multi.forEach((i) => { isMulti[i] = 1; });
     const shipArr = Float64Array.from(ship);
 
     const wantedUnits = wanted.reduce((a, w) => a + w.qty, 0);
@@ -661,46 +657,47 @@
 
     return { units, bestUnit, bestSeller, reachable, ship, wanted, sellerNames,
       wantedUnits, reachableUnits, nobodyHas, medianShip, allQtyOne, S, W,
-      slotCard, nSlots, priceMat, slotOK, shipArr };
+      first, multi, isMulti, shipArr };
   }
 
   // Cost of a line-up, in numbers only — no allocation, no shopping lists.
-  function scoreCombo(m, idx) {
-    const S = m.S, P = m.priceMat, n = m.nSlots, k = idx.length;
+  // dropCard scores it as if that card had never been on the list.
+  function scoreCombo(m, idx, dropCard = -1) {
+    const S = m.S, F = m.first, k = idx.length;
     let cards = 0, covered = 0, missing = 0;
     const gaps = [];
-    for (let sl = 0; sl < n; sl++) {
-      if (!m.slotOK[sl]) continue;
-      const base = sl * S;
+    for (let i = 0; i < m.W; i++) {
+      if (i === dropCard || m.isMulti[i] || !m.reachable[i]) continue;
+      const base = i * S;
       let best = Infinity;
-      for (let t = 0; t < k; t++) { const v = P[base + idx[t]]; if (v < best) best = v; }
+      for (let t = 0; t < k; t++) { const v = F[base + idx[t]]; if (v < best) best = v; }
       if (best < Infinity) { cards += best; covered++; }
-      else {
-        missing++;
-        const c = m.slotCard[sl];
-        if (gaps.length < 3 && gaps.indexOf(c) === -1) gaps.push(c);
+      else { missing++; if (gaps.length < 3) gaps.push(i); }
+    }
+    for (let q = 0; q < m.multi.length; q++) {
+      const i = m.multi[q];
+      if (i === dropCard) continue;
+      const need = m.reachable[i];
+      // k-way merge of the chosen sellers' sorted unit prices
+      const pos = new Array(k).fill(0);
+      let got = 0;
+      while (got < need) {
+        let best = Infinity, bt = -1;
+        for (let t = 0; t < k; t++) {
+          const u = m.units[i][idx[t]];
+          if (pos[t] < u.length && u[pos[t]] < best) { best = u[pos[t]]; bt = t; }
+        }
+        if (bt < 0) break;
+        pos[bt]++; got++; cards += best;
       }
+      covered += got;
+      if (got < need) { missing += need - got; if (gaps.length < 3) gaps.push(i); }
     }
     let ship = 0;
     for (let t = 0; t < k; t++) ship += m.shipArr[idx[t]];
     return { cards, ship, total: cards + ship, covered, missing, gaps };
   }
-
-  // Same scoring, but pretending one card was never on the list.
-  function scoreWithout(m, idx, dropCard) {
-    const S = m.S, P = m.priceMat, n = m.nSlots, k = idx.length;
-    let cards = 0, missing = 0;
-    for (let sl = 0; sl < n; sl++) {
-      if (!m.slotOK[sl] || m.slotCard[sl] === dropCard) continue;
-      const base = sl * S;
-      let best = Infinity;
-      for (let t = 0; t < k; t++) { const v = P[base + idx[t]]; if (v < best) best = v; }
-      if (best < Infinity) cards += best; else missing++;
-    }
-    let ship = 0;
-    for (let t = 0; t < k; t++) ship += m.shipArr[idx[t]];
-    return { total: cards + ship, ship, missing };
-  }
+  const scoreWithout = (m, idx, dropCard) => scoreCombo(m, idx, dropCard);
 
   // What a basket costs as it stands, and which cards it cannot supply.
   function evalCombo(m, idx) {
@@ -743,12 +740,6 @@
     };
   }
 
-  // Cheapest known price for everything a basket is missing — a valid floor on
-  // what completing it can cost, used to prune the search.
-  function completionFloor(m, r) {
-    return r.total + r.gaps.reduce((a, g) => a + g.price * g.qty, 0);
-  }
-
   // Extend a basket, cheapest-first, until it covers everything reachable.
   // Comparing completed orders is the only fair comparison: otherwise a basket
   // looks cheap simply by leaving expensive cards out.
@@ -774,30 +765,6 @@
     return { combo: evalCombo(m, cur), added };
   }
 
-  // Drop any seller the basket no longer needs, then try single swaps.
-  function polish(m, r) {
-    let cur = r;
-    let improved = true;
-    while (improved) {
-      improved = false;
-      for (let p = 0; p < cur.idx.length; p++) {
-        const cand = cur.idx.filter((_, q) => q !== p);
-        if (!cand.length) continue;
-        const alt = evalCombo(m, cand);
-        if (alt.missingUnits <= cur.missingUnits && alt.total < cur.total) { cur = alt; improved = true; break; }
-      }
-    }
-    for (let p = 0; p < cur.idx.length; p++) {
-      for (let j = 0; j < m.S; j++) {
-        if (cur.idx.includes(j)) continue;
-        const cand = cur.idx.slice(); cand[p] = j;
-        const alt = evalCombo(m, cand.sort((a, b) => a - b));
-        if (alt.missingUnits <= cur.missingUnits && alt.total < cur.total) cur = alt;
-      }
-    }
-    return cur;
-  }
-
   function* combinations(n, k, start = 0, acc = []) {
     if (acc.length === k) { yield acc.slice(); return; }
     for (let i = start; i <= n - (k - acc.length); i++) {
@@ -813,13 +780,15 @@
     return r;
   }
 
-  const comboKey = (r) => r.idx.join('-');
-
   /*
-   * Exhaustive for small line-ups, then greedy with a swap pass for larger ones.
-   * Only the handful we display get turned into full baskets.
+   * Exhaustive for every line-up size that fits a compute budget (usually up
+   * to 3-4 parcels), then greedy growth with swap passes — restarted from
+   * several promising sellers, because a single greedy path commits to its
+   * first pick and can miss the pairings that win at larger sizes.
    */
   const MISS_PENALTY = 1000;      // coverage first, price second
+  const EXH_BUDGET = 60000;       // combinations scored exhaustively per size
+  const SEEDS = 5;                // extra greedy restarts
 
   function searchBaskets(m, maxK) {
     const S = m.S;
@@ -829,34 +798,22 @@
     const consider = (idx, r) => {
       if (r.missing === 0) {
         const k = idx.length;
-        if (!bestByIdx[k] || r.total < bestByIdx[k].total) bestByIdx[k] = { idx: idx.slice(), total: r.total };
+        if (!bestByIdx[k] || r.total < bestByIdx[k].total - 1e-9) bestByIdx[k] = { idx: idx.slice(), total: r.total };
       }
     };
 
-    const EXH = Math.min(3, S);
-    for (let k = 1; k <= EXH; k++) {
+    for (let k = 1; k <= Math.min(maxK, S); k++) {
+      if (nCk(S, k) > EXH_BUDGET) break;
       for (const idx of combinations(S, k)) consider(idx, scoreCombo(m, idx));
     }
 
-    // Grow one seller at a time, improving each size with single swaps.
-    let idx = [];
-    for (let k = 1; k <= Math.min(maxK, S); k++) {
-      let add = null;
-      for (let j = 0; j < S; j++) {
-        if (idx.indexOf(j) !== -1) continue;
-        const cand = idx.concat(j).sort((x, y) => x - y);
-        const r = scoreCombo(m, cand);
-        const sc = rank(r);
-        if (!add || sc < add.sc) add = { sc, cand, r };
-      }
-      if (!add) break;
-      idx = add.cand;
-
+    const improve = (start) => {
+      let idx = start;
+      let cur = rank(scoreCombo(m, idx));
       let improved = true;
       let guard = 0;
-      while (improved && guard++ < 6) {
+      while (improved && guard++ < 5) {
         improved = false;
-        let cur = rank(scoreCombo(m, idx));
         for (let p = 0; p < idx.length; p++) {
           for (let j = 0; j < S; j++) {
             if (idx.indexOf(j) !== -1) continue;
@@ -868,21 +825,49 @@
           }
         }
       }
-      consider(idx, scoreCombo(m, idx));
+      return idx;
+    };
 
-      // A smaller line-up may still cover everything — try dropping each seller.
-      if (idx.length > 1) {
-        for (let p = 0; p < idx.length; p++) {
-          const cand = idx.filter((_, q) => q !== p);
-          consider(cand, scoreCombo(m, cand));
+    // Grow one seller at a time from a starting line-up.
+    const grow = (seed) => {
+      let idx = seed.slice();
+      if (idx.length) consider(idx, scoreCombo(m, idx));
+      while (idx.length < Math.min(maxK, S)) {
+        let add = null;
+        for (let j = 0; j < S; j++) {
+          if (idx.indexOf(j) !== -1) continue;
+          const cand = idx.concat(j).sort((x, y) => x - y);
+          const sc = rank(scoreCombo(m, cand));
+          if (!add || sc < add.sc) add = { sc, cand };
+        }
+        if (!add) break;
+        idx = improve(add.cand);
+        consider(idx, scoreCombo(m, idx));
+
+        // A smaller line-up may still cover everything — try dropping each seller.
+        if (idx.length > 1) {
+          for (let p = 0; p < idx.length; p++) {
+            const cand = idx.filter((_, q) => q !== p);
+            consider(cand, scoreCombo(m, cand));
+          }
         }
       }
-    }
+    };
 
+    grow([]);
+    const seeds = [...Array(S).keys()]
+      .map((j) => ({ j, r: scoreCombo(m, [j]) }))
+      .sort((a, b) => rank(a.r) - rank(b.r))
+      .slice(0, SEEDS);
+    seeds.forEach(({ j }) => grow([j]));
+
+    // A bigger line-up that costs more than a smaller one is never worth showing.
     const bestByK = [];
     const complete = [];
+    let floor = Infinity;
     bestByIdx.forEach((entry, k) => {
-      if (!entry) return;
+      if (!entry || entry.total >= floor - 0.005) return;
+      floor = entry.total;
       const full = evalCombo(m, entry.idx);
       bestByK[k] = full;
       complete.push(full);
@@ -943,12 +928,15 @@
     css.textContent = `
       #cmSSO { scroll-margin-top: 100px; }
       #cmSSO .cmSSO-bar { height: 6px; background: var(--bs-secondary-bg, #e9ecef); border-radius: 3px; overflow: hidden; }
-      #cmSSO .cmSSO-bar > i { display: block; height: 100%; background: var(--bs-success, #198754); }
+      #cmSSO .cmSSO-bar > i { display: block; height: 100%; background: var(--bs-success, #198754); transition: width .2s; }
       #cmSSO .cmSSO-log { max-height: 6rem; overflow-y: auto; font-size: .8rem; }
       #cmSSO td, #cmSSO th { vertical-align: middle; }
-      #cmSSO .cmSSO-missing { font-size: .8rem; }
-      #cmSSO .cmSSO-win { box-shadow: inset 3px 0 0 var(--bs-success, #198754); }
+      #cmSSO .cmSSO-small { font-size: .8rem; }
       #cmSSO details > summary { cursor: pointer; }
+      #cmSSO .cmSSO-hero { border-left: 4px solid var(--bs-success, #198754) !important; }
+      #cmSSO .cmSSO-k { min-width: 6rem; line-height: 1.15; }
+      #cmSSO .cmSSO-k small { display: block; font-size: .75rem; opacity: .85; }
+      #cmSSO tr[data-single] { cursor: pointer; }
     `;
     document.head.appendChild(css);
   }
@@ -957,52 +945,62 @@
     const section = document.createElement('section');
     section.id = 'cmSSO';
     section.className = 'mb-4';
+    const chk = (attrs, label, on) => `<div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" ${attrs}${on ? ' checked' : ''}>
+        <label class="form-check-label">${label}</label></div>`;
     section.innerHTML = `
       <h2>Fewer shipments</h2>
       <div class="bg-white border rounded p-3">
-        <p class="text-muted mb-3">
-          The wizard optimises card price and happily splits your order over
-          <strong>${wiz.sellers.length}</strong> sellers. This checks every one of them properly,
-          so you can choose how few parcels you are willing to live with.
+        <p class="text-muted small mb-3">
+          The wizard split this order over <strong>${wiz.sellers.length}</strong> sellers to save cents on cards.
+          This scans every one of them and prices each option as a complete order, so you can see what
+          fewer parcels really cost — then puts the basket you pick in your cart.
         </p>
 
-        <div class="row g-2 align-items-end mb-3">
-          <div class="col-12 col-md-4">
-            <label class="form-label mb-1" for="cmSSO-wantlist">Wants list <span class="text-danger">*</span></label>
+        <div class="row g-2 align-items-end">
+          <div class="col-12 col-md-5">
+            <label class="form-label mb-1 small" for="cmSSO-wantlist">Wants list this wizard run used</label>
             <select id="cmSSO-wantlist" class="form-select form-select-sm"><option value="">Loading your lists…</option></select>
           </div>
           <div class="col-12 col-md-3">
-            <label class="form-label mb-1" for="cmSSO-source">Cards</label>
+            <label class="form-label mb-1 small" for="cmSSO-source">Cards to price</label>
             <select id="cmSSO-source" class="form-select form-select-sm">
               <option value="wizard">From these results</option>
               <option value="wantlist">Everything on the list</option>
             </select>
           </div>
-          <div class="col-6 col-md-3">
-            <label class="form-label mb-1" for="cmSSO-lang">Language</label>
-            <select id="cmSSO-lang" class="form-select form-select-sm">
-              <option value="English"${cfg.languages.join() === 'English' ? ' selected' : ''}>English only</option>
-              <option value=""${!cfg.languages.length ? ' selected' : ''}>Any language</option>
-              ${['German', 'French', 'Italian', 'Spanish', 'Japanese']
-                .map((l) => `<option value="${l}"${cfg.languages.join() === l ? ' selected' : ''}>${l} only</option>`).join('')}
-            </select>
-          </div>
-          <div class="col-6 col-md-2">
-            <label class="form-label mb-1" for="cmSSO-cond">Condition</label>
-            <select id="cmSSO-cond" class="form-select form-select-sm">
-              ${CONDITIONS.map((c) => `<option value="${c}"${c === cfg.minCondition ? ' selected' : ''}>${c} or better</option>`).join('')}
-            </select>
+          <div class="col-12 col-md-4 d-flex gap-2">
+            <button id="cmSSO-run" type="button" class="btn btn-primary btn-sm flex-grow-1"><span class="fonticon-wand me-2"></span>Scan sellers</button>
+            <button id="cmSSO-stop" type="button" class="btn btn-outline-danger btn-sm" hidden>Stop</button>
+            <button id="cmSSO-reanalyse" type="button" class="btn btn-outline-primary btn-sm" hidden>Last scan</button>
           </div>
         </div>
 
-        <div class="d-flex flex-wrap gap-2 mb-3">
-          <button id="cmSSO-run" type="button" class="btn btn-primary"><span class="fonticon-wand me-2"></span>Scan all sellers</button>
-          <button id="cmSSO-stop" type="button" class="btn btn-outline-danger" hidden>Stop</button>
-          <button id="cmSSO-reanalyse" type="button" class="btn btn-outline-primary" hidden>Re-analyse last scan</button>
-          <button id="cmSSO-clear" type="button" class="btn btn-outline-secondary ms-auto">Clear saved prices</button>
-        </div>
+        <details id="cmSSO-filters" class="mt-2">
+          <summary class="small text-muted">Filters · <span id="cmSSO-filter-sum"></span></summary>
+          <div class="border rounded p-2 mt-2 small">
+            <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+              <label for="cmSSO-cond">Condition</label>
+              <select id="cmSSO-cond" class="form-select form-select-sm w-auto">
+                ${CONDITIONS.map((c) => `<option value="${c}"${c === cfg.minCondition ? ' selected' : ''}>${c === 'PO' ? 'Any condition' : `${c} or better`}</option>`).join('')}
+              </select>
+            </div>
+            <div class="mb-1">Languages <span class="text-muted">— none ticked means any language</span></div>
+            <div class="mb-2">${LANGUAGE_NAMES.map((l) => chk(`data-lang="${l}"`, l, cfg.languages.includes(l))).join('')}</div>
+            <div class="mb-2">
+              ${chk('id="cmSSO-foil"', 'Foils allowed', cfg.allowFoil)}
+              ${chk('id="cmSSO-playset"', 'Skip playsets', cfg.excludePlayset)}
+              ${chk('id="cmSSO-altered"', 'Skip altered', cfg.excludeAltered)}
+              ${chk('id="cmSSO-signed"', 'Skip signed', cfg.excludeSigned)}
+            </div>
+            <div class="d-flex flex-wrap gap-2 align-items-center">
+              <button id="cmSSO-clear" type="button" class="btn btn-sm btn-outline-secondary">Clear saved prices</button>
+              <span class="text-muted">Filters apply to the next scan; prices are cached per filter set.</span>
+            </div>
+          </div>
+        </details>
 
-        <div id="cmSSO-progress" hidden>
+        <div id="cmSSO-progress" class="mt-3" hidden>
           <div class="cmSSO-bar mb-1"><i style="width:0%"></i></div>
           <div class="d-flex justify-content-between small text-muted">
             <span id="cmSSO-status">Starting…</span><span id="cmSSO-eta"></span>
@@ -1013,9 +1011,40 @@
         <div id="cmSSO-results" class="mt-3"></div>
       </div>`;
 
+    // Labels sit next to their checkbox; make clicking them toggle it.
+    section.querySelectorAll('#cmSSO-filters .form-check-label').forEach((lab) => {
+      lab.style.cursor = 'pointer';
+      lab.addEventListener('click', () => lab.previousElementSibling?.click());
+    });
+
     const anchor = document.querySelector('#ShoppingWizardResult')?.closest('section');
     if (anchor) anchor.after(section); else document.querySelector('main')?.appendChild(section);
     return section;
+  }
+
+  function filterSummary() {
+    const langs = !cfg.languages.length ? 'any language'
+      : cfg.languages.length <= 2 ? cfg.languages.join(' / ') : `${cfg.languages.length} languages`;
+    const skips = [cfg.excludePlayset && 'playsets', cfg.excludeAltered && 'altered', cfg.excludeSigned && 'signed']
+      .filter(Boolean);
+    return [
+      langs,
+      cfg.minCondition === 'PO' ? 'any condition' : `${cfg.minCondition} or better`,
+      cfg.allowFoil ? 'foils ok' : 'no foils',
+      skips.length ? `no ${skips.join('/')}` : '',
+    ].filter(Boolean).join(' · ');
+  }
+
+  function readFilters(panel) {
+    cfg.minCondition = panel.querySelector('#cmSSO-cond').value;
+    cfg.languages = [...panel.querySelectorAll('[data-lang]')].filter((el) => el.checked)
+      .map((el) => el.getAttribute('data-lang'));
+    cfg.allowFoil = panel.querySelector('#cmSSO-foil').checked;
+    cfg.excludePlayset = panel.querySelector('#cmSSO-playset').checked;
+    cfg.excludeAltered = panel.querySelector('#cmSSO-altered').checked;
+    cfg.excludeSigned = panel.querySelector('#cmSSO-signed').checked;
+    writeJSON(CFG_KEY, cfg);
+    panel.querySelector('#cmSSO-filter-sum').textContent = filterSummary();
   }
 
   ui.note = (msg, kind = 'info') => {
@@ -1037,72 +1066,47 @@
     wrap.querySelector('#cmSSO-eta').textContent = `${done} / ${total}`;
   };
 
+  const esc = (t) => String(t ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
   /*
    * Adding a basket to the cart
    *
-   * Cardmarket's add-to-cart form carries no action attribute — its own
-   * script reads data-ajax-action and wraps it in a request envelope. Rather
-   * than guess at that envelope, we load the seller's offer page in a hidden
-   * same-origin frame, tick the real checkboxes and click the site's own
-   * "add selected" button. Whatever call it makes is by definition correct.
+   * Cardmarket refuses to be framed, so we reproduce its own request: a POST of
+   * __cmtkn, idArticle[id] and amount[id] to the AddArticlesFromUserOffers
+   * action. The exact URL shape is probed once and remembered.
    *
-   * Adding is not buying. Everything lands in the cart for you to review.
+   * Why the old version lost cards:
+   *  - it only looked on the wants-filtered pages, but the scan recovers cards
+   *    the wants filter hides by searching them BY NAME — so those cards were
+   *    priced into the basket and then never found when adding;
+   *  - it sent each seller's whole basket as one request, so a single article
+   *    that had just sold (or an amount above what the seller has) could make
+   *    the whole batch bounce, and nothing retried it;
+   *  - a page that failed mid-seller threw away everything already collected;
+   *  - it asked for the full wanted quantity at every seller, even when the
+   *    basket split copies over several sellers.
+   *
+   * Now: articles are collected from the wants pages AND by name, every send is
+   * checked against the real cart, and whatever did not land is retried one
+   * article at a time and reported by name. Adding is not buying.
    */
 
-  function frameLoad(url, timeout = 30000) {
-    return new Promise((resolve, reject) => {
-      const f = document.createElement('iframe');
-      f.style.cssText = 'position:fixed;left:-10000px;top:0;width:1280px;height:900px;opacity:0;border:0';
-      let settled = false;
-      const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
-      f.addEventListener('load', () => done(resolve, f));
-      f.addEventListener('error', () => { f.remove(); done(reject, new Error('frame failed')); });
-      setTimeout(() => { if (!settled) { f.remove(); done(reject, new Error('frame timed out')); } }, timeout);
-      document.body.appendChild(f);
-      f.src = url;
-    });
-  }
-
-  /*
-   * The cart page does not use the offer-row markup, so counting those finds
-   * nothing however full the cart is. The header total is the dependable signal.
-   */
-  async function cartState() {
-    try {
-      const doc = await httpGetDoc(`${location.origin}/${LANG_SEG}/${GAME_SEG}/ShoppingCart`);
-      const header = doc.querySelector('#cart');
-      const value = parsePrice(header ? header.textContent : '');
-      const rows = doc.querySelectorAll(
-        '[id^="articleRow"], [id^="stockRow"], [id^="cartArticle"], .article-row, [data-id-article]').length;
-      return { value, rows };
-    } catch { return null; }
-  }
-
-  const cartGrew = (a, b) => !!a && !!b && (
-    (a.value != null && b.value != null && b.value > a.value + 0.001) || b.rows > a.rows);
-
-  const cartLabel = (st) => (!st ? 'unknown'
-    : `${st.rows} article${st.rows === 1 ? '' : 's'}${st.value != null ? `, ${euro(st.value)}` : ''}`);
-
-  /*
-   * Cardmarket refuses to be framed, so we reproduce the request. Its modal gave
-   * the fields (__cmtkn, idArticle[id], amount[id]) but not the URL; other forms
-   * post to /<lang>/<game>/PostGetAction/<ActionName>, so the action goes in the
-   * path. We try that first and confirm against your real cart before sending
-   * more. "AddArticles" is plural: one request per seller, not per card.
-   */
   const CART_ACTION = 'ShoppingCart_Add_AddArticlesFromUserOffers';
   const ROUTE_KEY = 'cmSSO.addRoute.v1';
+  const CART_CHUNK = 8;
 
   function addRoutes() {
     const base = `${location.origin}/${LANG_SEG}/${GAME_SEG}`;
-    return [
+    const all = [
       { id: 'ajax-path', url: `${base}/AjaxAction/${CART_ACTION}`, extra: {} },
       { id: 'postget-path', url: `${base}/PostGetAction/${CART_ACTION}`, extra: {} },
       { id: 'ajax-field', url: `${base}/AjaxAction`, extra: { action: CART_ACTION } },
       { id: 'ajax-field-alt', url: `${base}/AjaxAction`, extra: { ajaxAction: CART_ACTION } },
       { id: 'ajax-query', url: `${base}/AjaxAction?action=${encodeURIComponent(CART_ACTION)}`, extra: {} },
     ];
+    // Remembered shape first.
+    const known = localStorage.getItem(ROUTE_KEY);
+    return all.sort((a, b) => (b.id === known) - (a.id === known));
   }
 
   async function postCart(route, token, items) {
@@ -1123,168 +1127,301 @@
         },
         body: body.toString(),
       });
-      return { ok: res.ok, status: res.status, text: (await res.text().catch(() => '')).slice(0, 200) };
+      return { ok: res.ok, status: res.status };
     } catch (e) {
-      return { ok: false, status: 0, text: String(e.message) };
+      return { ok: false, status: 0 };
     }
   }
 
-  // Send one article down each candidate route until the cart actually grows.
-  async function findRoute(token, item, before, log) {
-    if (!before) return { route: null, reason: 'could not read your cart to confirm' };
-    for (const route of addRoutes()) {
-      const res = await postCart(route, token, [item]);
-      await sleep(1500);
-      const now = await cartState();
-      if (!now) return { route: null, reason: 'could not read your cart to confirm' };
-      if (cartGrew(before, now)) {
-        localStorage.setItem(ROUTE_KEY, route.id);
-        return { route, state: now };
-      }
-      log(`${route.id}: HTTP ${res.status}, cart still ${cartLabel(now)}`);
-      await sleep(400);
-    }
-    return { route: null, reason: 'none of the request shapes changed the cart' };
+  // The cart page, raw. The header carries the value; the body usually carries
+  // each article id, which lets us verify article by article.
+  async function cartSnapshot() {
+    try {
+      const res = await fetch(`${location.origin}/${LANG_SEG}/${GAME_SEG}/ShoppingCart`,
+        { credentials: 'same-origin', cache: 'no-store' });
+      if (!res.ok) return null;
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const header = doc.querySelector('#cart');
+      return { value: parsePrice(header ? header.textContent : ''), html };
+    } catch { return null; }
   }
 
-  // Read a seller's offer pages and pick the live article for each wanted card.
-  async function collectSellerArticles(seller, wantlistId, targets, param) {
-    const items = [];
+  const hasId = (snap, id) => !!snap && new RegExp(`(^|\\D)${id}(\\D|$)`).test(snap.html);
+  const valueGrew = (a, b) => !!a && !!b && a.value != null && b.value != null && b.value > a.value + 0.001;
+
+  // Read one seller's pages and pick live articles for every card we want there.
+  async function collectSellerArticles(seller, wantlistId, targets) {
     let token = null;
-    const pages = [];
-    if (wantlistId) {
-      for (let p = 1; p <= 120; p++) pages.push(sellerWantlistUrl(seller, wantlistId, p));
-    } else {
-      [...targets.values()].forEach((t) => pages.push(sellerSearchUrl(seller, t.name, param, 1)));
-    }
+    const cands = new Map();                    // card key -> Map(articleId -> offer)
+    const have = (key) => [...(cands.get(key)?.values() || [])].reduce((a, c) => a + c.count, 0);
+    const enough = () => [...targets].every(([k, t]) => have(k) >= t.qty);
 
-    for (let i = 0; i < pages.length; i++) {
-      if (aborted) break;
-      if ([...targets.values()].every((t) => t.done)) break;
-      const doc = await httpGetDoc(pages[i]);
+    const take = (doc) => {
       token = token || doc.querySelector('input[name="__cmtkn"]')?.getAttribute('value') || null;
       const rows = parseOfferRows(doc);
-      if (!rows.length) break;
-
       rows.forEach((r) => {
         const key = normName(r.name);
-        const want = targets.get(key);
-        if (!want || want.done || !r.articleId || !offerAllowed(r)) return;
-        const up = r.price - want.price;
-        if (up > 0.50 && up / Math.max(want.price, 0.01) > 0.15) { want.pricier = r.price; return; }
-        want.done = true;
-        want.paid = r.price;
-        items.push({ id: r.articleId, qty: want.qty || 1, name: r.name, price: r.price });
+        const t = targets.get(key);
+        if (!t || !r.articleId || !offerAllowed(r)) return;
+        const up = r.price - t.price;
+        if (up > 0.50 && up / Math.max(t.price, 0.01) > 0.15) {
+          t.pricier = Math.min(t.pricier ?? Infinity, r.price);
+          return;
+        }
+        const m = cands.get(key) || new Map();
+        m.set(r.articleId, { id: r.articleId, price: r.price, count: Math.max(1, r.count) });
+        cands.set(key, m);
       });
+      return rows;
+    };
+    // One retry per page; a page that keeps failing ends the walk but keeps
+    // everything already collected.
+    const get = async (url) => {
+      try { return await httpGetDoc(url); } catch (e) {
+        if (aborted || String(e.message).startsWith('blocked')) throw e;
+        await sleep(2000);
+        return httpGetDoc(url);
+      }
+    };
 
-      if (wantlistId && rows.length < 15) break;
-      await sleep(jitter());
+    if (wantlistId) {
+      let seenFirst = null;
+      for (let p = 1; p <= 120 && !aborted && !enough(); p++) {
+        let doc;
+        try { doc = await get(sellerWantlistUrl(seller, wantlistId, p)); } catch (e) {
+          if (String(e.message).startsWith('blocked')) throw e;
+          break;
+        }
+        const rows = take(doc);
+        if (!rows.length) break;
+        if (rows[0].articleId && rows[0].articleId === seenFirst) break;
+        seenFirst = rows[0].articleId;
+        const next = doc.querySelector('a[data-direction="next"]');
+        if (!next || !next.getAttribute('href') || rows.length < 15) break;
+        await sleep(jitter());
+      }
     }
+
+    // Whatever the wants filter did not show, look up by name — the same
+    // fallback the scan uses, so every card it priced can actually be found.
+    const short = [...targets].filter(([k, t]) => have(k) < t.qty);
+    let param = localStorage.getItem(PARAM_KEY);
+    for (const [key, t] of short) {
+      if (aborted) break;
+      if (!param) {
+        try { param = await probeSearchParam(seller, t.name); } catch (e) {
+          if (String(e.message).startsWith('blocked')) throw e;
+        }
+        if (!param) continue;
+      }
+      for (let page = 1; page <= cfg.maxPagesPerCard; page++) {
+        let doc;
+        try { doc = await get(sellerSearchUrl(seller, t.name, param, page)); } catch (e) {
+          if (String(e.message).startsWith('blocked')) throw e;
+          break;
+        }
+        const rows = take(doc);
+        await sleep(jitter());
+        if (rows.length < 20 || have(key) >= t.qty) break;
+      }
+    }
+
+    // Cheapest live articles first, never asking for more than an article has.
+    const items = [];
+    targets.forEach((t, key) => {
+      const list = [...(cands.get(key)?.values() || [])].sort((a, b) => a.price - b.price);
+      let need = t.qty;
+      t.got = 0;
+      for (const c of list) {
+        if (need <= 0) break;
+        const q = Math.min(need, c.count);
+        items.push({ id: c.id, qty: q, price: c.price, name: t.name, seller });
+        need -= q;
+        t.got += q;
+      }
+    });
     return { token, items };
   }
 
   async function addBasketToCart(m, r, opts) {
     const dry = !!opts.dryRun;
     const wantlistId = document.querySelector('#cmSSO-wantlist')?.value || null;
-    const param = localStorage.getItem(PARAM_KEY) || 'name';
     const out = document.querySelector('#cmSSO-cart-out');
-    const log = (t) => { const d = document.createElement('div'); d.textContent = t; out.appendChild(d); };
+    out.innerHTML = `<div class="cmSSO-bar mb-1"><i style="width:0%"></i></div>
+      <div class="small text-muted" data-status>Starting…</div><div class="cmSSO-log text-muted mt-1" data-log></div>`;
+    const bar = out.querySelector('.cmSSO-bar > i');
+    const status = (t, frac) => { out.querySelector('[data-status]').textContent = t; bar.style.width = `${frac * 100}%`; };
+    const log = (t) => {
+      const box = out.querySelector('[data-log]');
+      if (!box) return;
+      const d = document.createElement('div'); d.textContent = t; box.appendChild(d); box.scrollTop = box.scrollHeight;
+    };
     aborted = false;
 
+    // Per seller: how many copies of each card this basket buys there.
     const bySeller = new Map();
     r.idx.forEach((j, p) => {
       const targets = new Map();
-      r.lines[p].forEach((x) => targets.set(m.wanted[x.i].key, {
-        name: m.wanted[x.i].name, price: x.price, qty: m.wanted[x.i].qty, done: false,
-      }));
+      r.lines[p].forEach((x) => {
+        const w = m.wanted[x.i];
+        const t = targets.get(w.key) || { name: w.name, price: 0, qty: 0 };
+        t.qty += 1;
+        t.price = Math.max(t.price, x.price);
+        targets.set(w.key, t);
+      });
       if (targets.size) bySeller.set(m.sellerNames[j], targets);
     });
     if (!bySeller.size) { out.innerHTML = '<div class="alert alert-warning">Nothing in this basket.</div>'; return; }
+    const wantedUnits = [...bySeller.values()].reduce((a, ts) => a + [...ts.values()].reduce((b, t) => b + t.qty, 0), 0);
 
-    let before = dry ? null : await cartState();
-    const cachedId = localStorage.getItem(ROUTE_KEY);
-    let route = dry ? null : addRoutes().find((x) => x.id === cachedId) || null;
-    let added = 0;
-    let sellerNo = 0;
-
+    // Phase 1 — find the live articles.
+    const batches = [];
+    let n = 0;
     for (const [seller, targets] of bySeller) {
       if (aborted) break;
-      sellerNo++;
-      out.innerHTML = `<div class="cmSSO-bar mb-1"><i style="width:${((sellerNo - 1) / bySeller.size) * 100}%"></i></div>
-        <div class="small text-muted">${dry ? 'Checking' : 'Adding'} ${seller} — ${sellerNo} of ${bySeller.size}</div>`;
-
-      let found;
+      status(`Finding articles at ${seller} (${++n} of ${bySeller.size})…`, (n - 1) / bySeller.size * (dry ? 1 : 0.4));
       try {
-        found = await collectSellerArticles(seller, wantlistId, targets, param);
+        const found = await collectSellerArticles(seller, wantlistId, targets);
+        if (found.items.length) batches.push({ seller, ...found });
       } catch (e) {
         log(`${seller}: could not read their offers (${e.message})`);
-        continue;
+        if (String(e.message).startsWith('blocked')) { log('Cardmarket is throttling us — stopped. Try again in a few minutes.'); break; }
       }
-      if (dry || !found.items.length) continue;
+    }
 
-      // First real send: work out which request shape this site wants.
+    const missedTargets = [];
+    bySeller.forEach((targets, seller) => targets.forEach((t) => {
+      const short = t.qty - (t.got || 0);
+      if (short > 0) missedTargets.push({ seller, name: t.name, qty: short, why: t.pricier != null ? 'pricier' : 'gone', price: t.pricier });
+    }));
+    const foundUnits = batches.reduce((a, b) => a + b.items.reduce((s, it) => s + it.qty, 0), 0);
+
+    if (dry) {
+      out.innerHTML = summaryHtml({ dry, wantedUnits, foundUnits, missedTargets, failed: [], added: 0, already: 0 });
+      return;
+    }
+
+    // Phase 2 — send, verify against the real cart, retry singles.
+    let snap = await cartSnapshot();
+    if (!snap) {
+      out.innerHTML = '<div class="alert alert-danger">Could not read your cart, so nothing was sent. Are you logged in?</div>';
+      return;
+    }
+    const queue = batches.flatMap((b) => b.items.map((it) => ({ ...it, token: b.token })));
+    // If the cart page shows article ids at all, it shows the ones already in it.
+    let idsVisible = queue.some((it) => hasId(snap, it.id)) || null;
+    const already = idsVisible ? queue.filter((it) => hasId(snap, it.id)) : [];
+    let todo = queue.filter((it) => !already.includes(it));
+    const added = [];
+    const failed = [];
+    const totalSend = todo.length || 1;
+    let route = null;
+
+    // Did these items land between two snapshots?
+    const landed = (before, after, items) => {
+      if (!after) return [];
+      if (idsVisible) return items.filter((it) => hasId(after, it.id));
+      return valueGrew(before, after) ? items : [];          // only used one at a time
+    };
+
+    // Calibrate on the first article: find the request shape, learn whether the
+    // cart page exposes ids (then we can batch), else go one at a time.
+    while (todo.length && !route && !aborted) {
+      const it = todo[0];
+      status(`Adding ${it.name}…`, 0.4);
+      for (const rt of addRoutes()) {
+        await postCart(rt, it.token, [it]);
+        await sleep(1300);
+        const now = await cartSnapshot();
+        if (now && (hasId(now, it.id) || valueGrew(snap, now))) {
+          route = rt;
+          localStorage.setItem(ROUTE_KEY, rt.id);
+          if (idsVisible == null) idsVisible = hasId(now, it.id);
+          snap = now;
+          break;
+        }
+        if (now) snap = now;
+        await sleep(400);
+      }
       if (!route) {
-        const probe = await findRoute(found.token, found.items[0], before, log);
-        if (!probe.route) {
-          out.innerHTML = `<div class="alert alert-danger">
-            <strong>Could not add to the cart automatically</strong> — ${probe.reason}. Nothing was bought.
-            <div class="mt-2">Use the seller links in the breakdown below: each opens that seller's offers
-            filtered to your list, where you can tick the boxes and press Cardmarket's own add button.</div></div>`;
-          return;
-        }
-        route = probe.route;
-        added += 1;                                   // the probe article itself
-        before = probe.state;
-        log(`request shape: ${route.id}`);
-        const rest = found.items.slice(1);
-        if (rest.length) {
-          await postCart(route, found.token, rest);
-          await sleep(1500);
-          const now = await cartState();
-          added += cartGrew(before, now) ? Math.max(1, now.rows - before.rows) : 0;
-          if (!cartGrew(before, now)) log(`${seller}: the rest of this basket did not register`);
-          before = now || before;
-        }
+        // Maybe this one article sold. Try the next before giving up entirely.
+        failed.push(it);
+        todo.shift();
+        if (failed.length >= 3) break;
         continue;
       }
+      added.push(it);
+      todo.shift();
+    }
+    // Gave up after three refusals in a row. If nothing ever landed, the
+    // request itself is wrong; otherwise those articles are simply gone.
+    if (!route && todo.length && !already.length) {
+      out.innerHTML = `<div class="alert alert-danger"><strong>Could not add to the cart automatically</strong> —
+        none of the request shapes changed your cart. Nothing was bought.
+        <div class="mt-2">Use <em>Copy list</em> and the seller links below, or press <em>Diagnose cart</em> and send the output.</div></div>`;
+      return;
+    }
+    if (!route) { failed.push(...todo); todo = []; }
+    if (route) log(`request shape: ${route.id}; verifying ${idsVisible ? 'by article id, in batches' : 'by cart value, one at a time'}`);
 
-      await postCart(route, found.token, found.items);
-      await sleep(1500);
-      const now = await cartState();
-      if (cartGrew(before, now)) added += Math.max(1, now.rows - before.rows);
-      else log(`${seller}: nothing registered — their offers may have just sold`);
-      before = now || before;
+    const chunk = idsVisible ? CART_CHUNK : 1;
+    const retry = [];
+    for (let i = 0; i < todo.length && !aborted; i += chunk) {
+      const part = todo.slice(i, i + chunk);
+      status(`Adding ${part[0].seller}: ${part.map((x) => x.name).join(', ')}`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
+      await postCart(route, part[0].token, part);
+      await sleep(1200);
+      const now = await cartSnapshot();
+      const ok = landed(snap, now, part);
+      added.push(...ok);
+      part.filter((x) => !ok.includes(x)).forEach((x) => retry.push(x));
+      if (now) snap = now;
       await sleep(jitter());
     }
 
-    const missed = [];
-    bySeller.forEach((targets, seller) => targets.forEach((t) => {
-      if (!t.done) missed.push({ seller, name: t.name, pricier: t.pricier });
-    }));
-    const wantedCount = [...bySeller.values()].reduce((a, t) => a + t.size, 0);
-    const after = dry ? null : await cartState();
+    // Second chance, one article per request, after a short pause.
+    if (retry.length && !aborted) {
+      log(`${retry.length} article${retry.length === 1 ? '' : 's'} did not register — retrying one by one`);
+      await sleep(2500);
+      for (const it of retry) {
+        if (aborted) break;
+        status(`Retrying ${it.name} (${it.seller})…`, 0.4 + 0.6 * ((added.length + failed.length) / totalSend));
+        await postCart(route, it.token, [it]);
+        await sleep(1500);
+        const now = await cartSnapshot();
+        if (landed(snap, now, [it]).length) added.push(it); else failed.push(it);
+        if (now) snap = now;
+        await sleep(jitter());
+      }
+    }
 
-    const rows = missed.map((x) => `<tr>
-        <td class="text-start">${x.name}</td><td class="text-start">${x.seller}</td>
-        <td class="text-start">${x.pricier != null
-          ? `<span class="badge text-bg-warning">price rose</span> now ${euro(x.pricier)}`
-          : '<span class="badge text-bg-secondary">not found</span> not on their pages now'}</td>
-      </tr>`).join('');
+    const units = (list) => list.reduce((a, it) => a + it.qty, 0);
+    out.innerHTML = summaryHtml({
+      dry, wantedUnits, foundUnits, missedTargets, failed,
+      added: units(added), already: units(already), cart: snap,
+    });
+  }
 
-    out.innerHTML = `
-      <div class="alert alert-${missed.length ? 'warning' : 'success'}">
-        ${dry
-          ? `<strong>Test run:</strong> ${wantedCount - missed.length} of ${wantedCount} cards are still there at the expected price. Nothing was added.`
-          : `<strong>${added} of ${wantedCount} cards added.</strong>
-             ${after ? ` Your cart now holds ${cartLabel(after)}.` : ''}
-             <a href="/${LANG_SEG}/${GAME_SEG}/ShoppingCart">Open the cart</a> to check shipping and place each order.`}
-      </div>
-      ${rows ? `<div class="table-responsive"><table class="table table-sm">
+  function summaryHtml({ dry, wantedUnits, foundUnits, missedTargets, failed, added, already, cart }) {
+    const rows = [
+      ...missedTargets.map((x) => [x.name, x.seller, x.why === 'pricier'
+        ? `<span class="badge text-bg-warning">price rose</span> now ${euro(x.price)}`
+        : '<span class="badge text-bg-secondary">sold out</span> not on their pages any more']),
+      ...failed.map((x) => [x.name, x.seller,
+        '<span class="badge text-bg-danger">refused</span> Cardmarket did not accept it — likely just sold']),
+    ].map(([a, b, c]) => `<tr><td class="text-start">${esc(a)}</td><td class="text-start">${esc(b)}</td><td class="text-start">${c}</td></tr>`).join('');
+    const short = missedTargets.reduce((a, x) => a + x.qty, 0) + failed.reduce((a, x) => a + x.qty, 0);
+    const head = dry
+      ? `<strong>${foundUnits} of ${wantedUnits} cards</strong> are still listed at the expected price. Nothing was added.`
+      : `<strong>${added + already} of ${wantedUnits} cards are in your cart</strong>${already ? ` (${already} were already there)` : ''}.
+         ${cart?.value != null ? `Cart value now ${euro(cart.value)}.` : ''}
+         <a href="/${LANG_SEG}/${GAME_SEG}/ShoppingCart">Open the cart</a> to check shipping and place each order.`;
+    return `<div class="alert alert-${short ? 'warning' : 'success'} mb-2">${head}</div>
+      ${rows ? `<div class="table-responsive"><table class="table table-sm mb-0">
         <thead><tr><th class="text-start">Card</th><th class="text-start">Seller</th><th class="text-start">What happened</th></tr></thead>
         <tbody>${rows}</tbody></table></div>` : ''}`;
   }
-
-  const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
   // The page a seller's offers live on, filtered to your wants list when we have one.
   function sellerPageUrl(m, seller, sampleName) {
@@ -1293,47 +1430,30 @@
       : sellerSearchUrl(seller, sampleName, localStorage.getItem(PARAM_KEY) || 'name', 1);
   }
 
-  /*
-   * Compares a plain fetch against the same page in a frame, and reads the
-   * single-article modal, to show whether framing is blocked.
-   */
   async function diagnoseCart(m, r) {
     const out = document.querySelector('#cmSSO-cart-out');
     out.innerHTML = '<div class="small text-muted">Running checks…</div>';
     const notes = [];
-    const seller = m.sellerNames[r.idx[0]];
-    const sample = m.wanted[r.lines[0][0].i];
-    const url = sellerPageUrl(m, seller, sample.name);
-    notes.push(`seller: ${seller}`);
-    notes.push(`page:   ${url}`);
+    const p = r.lines.findIndex((l) => l.length);
+    if (p < 0) { out.innerHTML = '<div class="alert alert-warning">Nothing in this basket.</div>'; return; }
+    const seller = m.sellerNames[r.idx[p]];
+    const url = sellerPageUrl(m, seller, m.wanted[r.lines[p][0].i].name);
+    notes.push(`seller: ${seller}`, `page:   ${url}`);
 
     let articleId = null;
     try {
       const doc = await httpGetDoc(url);
       const rows = parseOfferRows(doc);
       articleId = rows.find((x) => x.articleId)?.articleId || null;
-      notes.push(`fetched page -> ${rows.length} offer rows, first article ${articleId || 'none'}`);
-      const langs = rows.filter((x) => x.language).length;
-      notes.push(`  language readable on ${langs}/${rows.length} rows`);
-    } catch (e) { notes.push(`fetched page -> FAILED: ${e.message}`); }
-
-    try {
-      const f = await frameLoad(url, 20000);
-      let d = null;
-      try { d = f.contentDocument; } catch { /* cross-origin */ }
-      if (!d) notes.push('framed page  -> no access to the frame document (framing blocked)');
-      else {
-        const rows = parseOfferRows(d);
-        notes.push(`framed page  -> ${rows.length} offer rows, url ${d.location ? d.location.pathname : '?'}`);
-        notes.push(`  add-selected button present: ${!!d.querySelector('#BuyAllForm button[type="submit"]')}`);
-        notes.push(`  a checkbox present: ${!!d.querySelector('input[type="checkbox"][name^="idArticle"]')}`);
-      }
-      f.remove();
-    } catch (e) { notes.push(`framed page  -> FAILED: ${e.message}`); }
+      notes.push(`offer rows: ${rows.length}, first article ${articleId || 'none'}`);
+      notes.push(`  language readable on ${rows.filter((x) => x.language).length}/${rows.length} rows`);
+      notes.push(`  counts: ${rows.slice(0, 8).map((x) => x.count).join(',')}`);
+      notes.push(`  token present: ${!!doc.querySelector('input[name="__cmtkn"]')}`);
+    } catch (e) { notes.push(`offer page FAILED: ${e.message}`); }
 
     if (articleId) {
       const modal = `${location.origin}/${LANG_SEG}/${GAME_SEG}/Modal/Article_PutSingleInShoppingCart`
-        + `?idArticle=${articleId}&ajaxAction=ShoppingCart_Add_AddArticlesFromUserOffers&ajaxCB=Offers.addArticlesCB`;
+        + `?idArticle=${articleId}&ajaxAction=${CART_ACTION}&ajaxCB=Offers.addArticlesCB`;
       try {
         const res = await fetch(modal, { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
         const text = await res.text();
@@ -1344,11 +1464,13 @@
         notes.push(`  data-ajax-action: ${form ? (form.getAttribute('data-ajax-action') || '(none)') : '-'}`);
         notes.push('  fields: ' + [...doc.querySelectorAll('input[name],select[name]')]
           .map((i) => `${i.getAttribute('name')}=${String(i.getAttribute('value') || '').slice(0, 24)}`).join(', '));
-      } catch (e) { notes.push(`modal -> FAILED: ${e.message}`); }
+      } catch (e) { notes.push(`modal FAILED: ${e.message}`); }
     }
 
+    const snap = await cartSnapshot();
+    const ids = snap ? (snap.html.match(/idArticle\D{0,6}(\d{6,})/g) || []).length : 0;
     notes.push(`remembered request shape: ${localStorage.getItem(ROUTE_KEY) || 'none yet'}`);
-    notes.push(`cart right now: ${cartLabel(await cartState())}`);
+    notes.push(`cart: ${snap ? `value ${euro(snap.value)}, ${snap.html.length} chars, ~${ids} article-id mentions` : 'unreadable'}`);
     console.log('[cmSSO] add-to-cart diagnostics\n' + notes.join('\n'));
     out.innerHTML = `<div class="alert alert-info">
       <strong>Add-to-cart diagnostics</strong>
@@ -1357,21 +1479,27 @@
   }
 
   /*
-   * Rendering results
+   * Rendering helpers
    */
 
   function sellerLink(s) {
-    return `<a href="/${LANG_SEG}/${GAME_SEG}/Users/${encodeURIComponent(s)}/Offers/Singles" target="_blank" rel="noopener">${s}</a>`;
+    return `<a href="/${LANG_SEG}/${GAME_SEG}/Users/${encodeURIComponent(s)}/Offers/Singles" target="_blank" rel="noopener">${esc(s)}</a>`;
   }
   function cardSearchLink(name) {
-    return `<a href="/${LANG_SEG}/${GAME_SEG}/Products/Search?searchString=${encodeURIComponent(name)}" target="_blank" rel="noopener">${name}</a>`;
+    return `<a href="/${LANG_SEG}/${GAME_SEG}/Products/Search?searchString=${encodeURIComponent(name)}" target="_blank" rel="noopener">${esc(name)}</a>`;
   }
   function gapList(m, gaps, limit = 60) {
     if (!gaps.length) return '<span class="text-success">nothing missing</span>';
     const items = gaps.slice(0, limit).map((g) =>
       `<li>${cardSearchLink(m.wanted[g.i].name)}${g.qty > 1 ? ` ×${g.qty}` : ''}
-        <span class="text-muted">— ${euro(g.price)} at ${g.seller}</span></li>`).join('');
+        <span class="text-muted">— ${euro(g.price)} at ${esc(g.seller)}</span></li>`).join('');
     return `<ul class="mb-0 ps-3">${items}${gaps.length > limit ? `<li class="text-muted">+${gaps.length - limit} more</li>` : ''}</ul>`;
+  }
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  function vsWizard(total, wiz) {
+    if (wiz.wizardTotal == null) return '';
+    const d = total - wiz.wizardTotal;
+    return `<span class="${d < 0 ? 'text-success' : 'text-danger'}">${d < 0 ? '−' : '+'}${euro(Math.abs(d))} vs the wizard</span>`;
   }
 
   async function copyText(text) {
@@ -1408,8 +1536,7 @@
 
   /*
    * The wizard already named a seller for every card it placed. If our scan
-   * says nobody stocks one of those, the scan is wrong, not the market — so
-   * say so instead of quietly telling you to buy it elsewhere.
+   * says nobody stocks one of those, the scan is wrong, not the market.
    */
   function wizardContradictions(m, wiz) {
     const byKey = new Map();
@@ -1420,217 +1547,144 @@
     return m.nobodyHas.map((w) => ({ w, hit: byKey.get(w.key) })).filter((x) => x.hit);
   }
 
-  function renderRecommendations(m, search, wiz, singlesByIdx) {
-    const { complete, bestByK } = search;
-    if (!complete.length) {
-      return `<div class="alert alert-warning">No line-up covers every card. Look at the seller table below and pick from there.</div>`;
-    }
+  /*
+   * Results: one hero card with the parcel picker and the cart button, the
+   * chosen basket underneath, then insights, and the deep-dive tables folded.
+   */
 
-    const cheapest = complete[0];
-    const sizes = bestByK.map((r, k) => (r ? { k, r } : null)).filter(Boolean);
-    const fewest = sizes[0];
-    const bestSingle = singlesByIdx.slice().sort((a, b) => b.found - a.found || a.total - b.total)[0];
-    const singleDone = completeOf(m, bestSingle.idx);
-    const base = wiz.wizardTotal;
+  let VIEW = null;       // last scan, unfiltered
+  let STATE = null;      // current analysis + selected basket
+  let excluded = new Set(readJSON(EXCL_KEY, []));
+  let cardsOpen = false;
+  let singlesOpen = false;
+  let cardFilter = '';
 
-    const vs = (v) => (base == null ? '' :
-      ` <span class="${v < base ? 'text-success' : 'text-danger'}">(${v < base ? '−' : '+'}${euro(Math.abs(v - base))} vs the wizard)</span>`);
+  function saveExcluded() { writeJSON(EXCL_KEY, [...excluded]); }
 
-    const items = [];
-
-    items.push(`<li class="mb-2"><strong>Cheapest complete order:
-      ${cheapest.sellers.map(sellerLink).join(' + ')}</strong> — all ${cheapest.found} available cards in
-      ${cheapest.idx.length} parcel${cheapest.idx.length > 1 ? 's' : ''} for <strong>${euro(cheapest.total)}</strong>
-      (${euro(cheapest.cardCost)} cards + ${euro(cheapest.ship)} shipping).${vs(cheapest.total)}</li>`);
-
-    if (fewest && fewest.r !== cheapest) {
-      const extra = fewest.r.total - cheapest.total;
-      items.push(`<li class="mb-2"><strong>Fewest parcels: ${fewest.r.sellers.map(sellerLink).join(' + ')}</strong> —
-        the same ${fewest.r.found} cards in just ${fewest.k} parcel${fewest.k > 1 ? 's' : ''} for ${euro(fewest.r.total)}.
-        That is <strong>${euro(extra)}</strong> more than the cheapest option, for
-        ${cheapest.idx.length - fewest.k} fewer parcel${cheapest.idx.length - fewest.k === 1 ? '' : 's'} to wait for.${vs(fewest.r.total)}</li>`);
-    }
-
-    items.push(`<li class="mb-2"><strong>Biggest single seller: ${sellerLink(bestSingle.sellers[0])}</strong> —
-      ${bestSingle.found} of ${m.reachableUnits} cards for ${euro(bestSingle.total)} on its own.
-      ${bestSingle.gaps.length
-        ? `The ${bestSingle.gaps.length} card${bestSingle.gaps.length === 1 ? '' : 's'} it lacks are cheapest to pick up from
-           ${singleDone.added.map(sellerLink).join(' + ') || 'nobody in this scan'},
-           making ${euro(singleDone.combo.total)} all in.${vs(singleDone.combo.total)}`
-        : 'It covers everything on its own.'}</li>`);
-
-    // Cards whose real cost is mostly the parcel they force
-    const offenders = m.wanted.map((w, i) => ({ w, c: costOfCard(m, search, i) }))
-      .filter((x) => x.c && x.c.saving > 0.01)
-      .sort((a, b) => b.c.saving - a.c.saving);
-    const draggers = offenders.filter((x) => x.c.fewerParcels > 0);
-
-    if (draggers.length) {
-      const top = draggers[0];
-      items.push(`<li class="mb-2"><strong>${cardSearchLink(top.w.name)} is the expensive one to keep</strong> —
-        dropping it saves ${euro(top.c.saving)} and ${top.c.fewerParcels} parcel${top.c.fewerParcels === 1 ? '' : 's'},
-        yet the card itself is only ${euro(top.c.cardSaved)}. The other ${euro(top.c.shipSaved)} is the shipping
-        it drags along.${draggers.length > 1
-          ? ` ${draggers.length - 1} other card${draggers.length === 2 ? '' : 's'} do the same — see the card list above.`
-          : ''}</li>`);
-    } else if (offenders.length) {
-      items.push(`<li class="mb-2">No single card is forcing an extra parcel — every seller in this basket is
-        carrying its weight. Dropping cards would only save their own price.</li>`);
-    }
-
-    const clashes = wizardContradictions(m, wiz);
-    if (clashes.length) {
-      items.push(`<li class="mb-2"><strong class="text-danger">The scan missed ${clashes.length} card${clashes.length === 1 ? '' : 's'} the wizard did find.</strong>
-        ${clashes.slice(0, 6).map((x) => `${cardSearchLink(x.w.name)} <span class="text-muted">(${x.hit.seller}, ${euro(x.hit.price)})</span>`).join(', ')}${clashes.length > 6 ? ` and ${clashes.length - 6} more` : ''}.
-        That means the sweep did not see those sellers' full stock — usually a saved scan made with a different wants list.
-        Press <em>Clear saved prices</em> above and run again, and check the wants list matches the one this wizard run used.</li>`);
-    }
-
-    if (m.nobodyHas.length) {
-      items.push(`<li class="mb-2"><strong>Not available from any of these ${m.S} sellers:</strong>
-        ${m.nobodyHas.map((w) => cardSearchLink(w.name)).join(', ')}. Every total above excludes
-        ${m.nobodyHas.length === 1 ? 'it' : 'them'}, so budget for one more order.</li>`);
-    }
-
-    const cheapestK = cheapest.idx.length;
-    const slider = sizes.length < 2 ? '' : `
-      <h5 class="mt-4">How many parcels?</h5>
-      <p class="small text-muted mb-2">Every position buys all ${m.reachableUnits} available cards — only the
-        number of sellers changes. <strong>${cheapestK} parcel${cheapestK === 1 ? '' : 's'}</strong> is the cheapest.</p>
-      <div class="px-1">
-        <input type="range" class="form-range" id="cmSSO-parcels" list="cmSSO-ticks"
-          min="${sizes[0].k}" max="${sizes[sizes.length - 1].k}" step="1" value="${cheapestK}">
-        <datalist id="cmSSO-ticks">${sizes.map(({ k }) => `<option value="${k}" label="${k}"></option>`).join('')}</datalist>
-        <div class="d-flex justify-content-between small text-muted">
-          <span>${sizes[0].k}</span><span>${sizes[sizes.length - 1].k} parcels</span>
-        </div>
-      </div>
-      <div id="cmSSO-pick-summary" class="mt-2"></div>`;
-
-
-
+  function renderHero(m, search) {
+    const sizes = search.bestByK.map((r, k) => (r ? { k, r } : null)).filter(Boolean);
+    const cheapest = search.complete[0];
+    const chips = sizes.map(({ k, r }) => `<button type="button" data-act="k" data-k="${k}"
+        class="btn btn-sm cmSSO-k ${r === cheapest ? 'btn-outline-success' : 'btn-outline-secondary'}">
+        ${plural(k, 'parcel')}<small>${euro(r.total)}${r === cheapest ? ' ★' : ''}</small></button>`).join('');
     return `
-      <div class="alert alert-light border">
-        <h5 class="mb-2">What to do</h5>
-        <ul class="mb-0">${items.join('')}</ul>
+      <div class="border rounded p-3 mb-3 cmSSO-hero">
+        ${sizes.length
+          ? `<div class="small text-muted mb-2">How many parcels? Every option buys all ${m.reachableUnits} available
+              cards, so the prices compare directly. ★ is the cheapest.</div>
+             <div class="d-flex flex-wrap gap-2 mb-3">${chips}</div>`
+          : '<div class="alert alert-warning py-2">No line-up covers every card. Pick a seller from the table below.</div>'}
+        <div id="cmSSO-pick"></div>
+        <div class="d-flex flex-wrap gap-2 mt-3 align-items-center">
+          <button type="button" data-act="add" class="btn btn-success"><span class="fonticon-cart me-2"></span>Add to cart</button>
+          <button type="button" data-act="check" class="btn btn-sm btn-outline-secondary">Check availability</button>
+          <button type="button" data-act="copy" class="btn btn-sm btn-outline-secondary">Copy list</button>
+          <button type="button" data-act="stop" class="btn btn-sm btn-outline-danger" hidden>Stop</button>
+          <button type="button" data-act="diag" class="btn btn-sm btn-link text-muted ms-auto">Diagnose cart</button>
+        </div>
+        <div id="cmSSO-cart-out" class="mt-2"></div>
       </div>
+      <div id="cmSSO-detail"></div>`;
+  }
 
-      ${slider}`;
+  function showBasket(r) {
+    if (!STATE || !r) return;
+    const { m, search, wiz } = STATE;
+    STATE.basket = r;
+    const cheapest = search.complete[0];
+    document.querySelectorAll('#cmSSO [data-act="k"]').forEach((b) => {
+      b.classList.toggle('active', search.bestByK[+b.getAttribute('data-k')] === r);
+    });
+    const extra = cheapest ? r.total - cheapest.total : 0;
+    const fin = r.missingUnits ? completeOf(m, r.idx) : null;
+    const pick = document.querySelector('#cmSSO-pick');
+    if (pick) {
+      pick.innerHTML = `
+        <div class="d-flex justify-content-between flex-wrap gap-2 align-items-end">
+          <div>${r.sellers.map(sellerLink).join(' + ')}
+            <div class="small text-muted">${plural(r.found, 'card')} · ${plural(r.idx.length, 'parcel')}</div></div>
+          <div class="text-end"><span class="fs-4 fw-bold">${euro(r.total)}</span>
+            <div class="small text-muted">${euro(r.cardCost)} cards + ${euro(r.ship)} shipping</div></div>
+        </div>
+        <div class="small mt-1">
+          ${!cheapest || extra < 0.005 ? '<span class="badge text-bg-success">cheapest</span>' : `<span class="text-muted">${euro(extra)} more than the cheapest</span>`}
+          ${wiz.wizardTotal != null ? ` · ${vsWizard(r.total, wiz)}` : ''}
+          ${r.missingUnits ? ` · <span class="text-danger">misses ${plural(r.missingUnits, 'card')}</span>
+            — cheapest finish: ${fin.added.map(sellerLink).join(' + ') || 'none in this scan'}, ${euro(fin.combo.total)} all in` : ''}
+        </div>`;
+    }
+    const cartOut = document.querySelector('#cmSSO-cart-out');
+    if (cartOut && !STATE.busy) cartOut.innerHTML = '';
+    renderDetail(m, r);
   }
 
   function renderDetail(m, r) {
     const box = document.querySelector('#cmSSO-detail');
     if (!box) return;
-    const fillers = gapFillers(m, r);
-    const fin = completeOf(m, r.idx);
-
     const perSeller = r.idx.map((j, p) => {
       const line = r.lines[p].slice().sort((a, b) => m.wanted[a.i].name.localeCompare(m.wanted[b.i].name));
       const sampleName = line.length ? m.wanted[line[0].i].name : (m.wanted[0] || {}).name || '';
-      return `<div class="col-12 col-lg-6 mb-3">
+      return `<div class="col-12 col-md-6 col-xl-4 mb-3">
         <div class="border rounded p-2 h-100">
-          <div class="d-flex justify-content-between flex-wrap">
+          <div class="d-flex justify-content-between flex-wrap gap-1">
             <strong><a href="${sellerPageUrl(m, m.sellerNames[j], sampleName)}" target="_blank" rel="noopener"
-              title="Open this seller's offers filtered to your list">${m.sellerNames[j]}</a></strong>
-            <span class="small">${line.length} cards · ${euro(line.reduce((a, x) => a + x.price, 0))} + ${euro(m.ship[j])} shipping</span>
+              title="Open this seller's offers filtered to your list">${esc(m.sellerNames[j])}</a></strong>
+            <span class="small text-muted">${line.length} · ${euro(line.reduce((a, x) => a + x.price, 0))} + ${euro(m.ship[j])}</span>
           </div>
-          <ul class="mb-0 ps-3 cmSSO-missing mt-1">
-            ${line.map((x) => `<li>${m.wanted[x.i].name} <span class="text-muted">${euro(x.price)}</span></li>`).join('') || '<li class="text-muted">nothing</li>'}
+          <ul class="mb-0 ps-3 cmSSO-small mt-1">
+            ${line.map((x) => `<li>${esc(m.wanted[x.i].name)} <span class="text-muted">${euro(x.price)}</span></li>`).join('') || '<li class="text-muted">nothing</li>'}
           </ul>
         </div></div>`;
     }).join('');
 
-    const fillerRows = fillers.map((f) => `<tr>
-        <td class="text-start">${sellerLink(f.seller)}</td>
-        <td class="text-center">+${f.adds}</td>
-        <td class="text-end ${f.saving > 0 ? 'text-success' : 'text-muted'}">${f.saving > 0 ? '−' : '+'}${euro(Math.abs(f.saving))}</td>
-        <td class="text-end">${euro(f.result.total)}</td>
-      </tr>`).join('');
-
+    const fillers = r.missingUnits ? gapFillers(m, r) : [];
     box.innerHTML = `
-      <hr>
-      <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
-        <h5 class="mb-0">${r.sellers.join(' + ')}</h5>
-        <div class="d-flex flex-wrap gap-2">
-          <button type="button" class="btn btn-sm btn-outline-secondary" id="cmSSO-check">Check availability</button>
-          <button type="button" class="btn btn-sm btn-success" id="cmSSO-add">Add basket to cart</button>
-          <button type="button" class="btn btn-sm btn-outline-secondary" id="cmSSO-copy">Copy shopping list</button>
-          <button type="button" class="btn btn-sm btn-outline-secondary" id="cmSSO-diag">Diagnose</button>
-        </div>
-      </div>
-      <p class="small text-muted mt-1">
-        ${euro(r.cardCost)} cards + ${euro(r.ship)} shipping = <strong>${euro(r.basket)}</strong>.
-        ${r.missingUnits
-          ? `Missing ${r.missingUnits} card${r.missingUnits === 1 ? '' : 's'}; the cheapest finish is ${fin.added.map(sellerLink).join(' + ') || 'not available in this scan'}, ${euro(fin.combo.total)} all in.`
-          : 'This basket needs nothing else.'}
-      </p>
       <div class="row">${perSeller}</div>
-      <div class="row">
-        <div class="col-12 col-lg-6 mb-3">
-          <h6>Missing from this basket</h6>
-          <div class="cmSSO-missing">${gapList(m, r.gaps)}</div>
-        </div>
-        <div class="col-12 col-lg-6 mb-3">
-          <h6>Best seller to add next</h6>
-          <table class="table table-sm">
-            <thead><tr><th class="text-start">Seller</th><th class="text-center">Cards added</th>
-              <th class="text-end">Change</th><th class="text-end">New total</th></tr></thead>
-            <tbody>${fillerRows || '<tr><td colspan="4" class="text-muted">nothing left to add</td></tr>'}</tbody>
-          </table>
-        </div>
-      </div>
-      <div id="cmSSO-cart-out" class="mt-2"></div>`;
-
-    const busy = (on) => {
-      ['#cmSSO-add', '#cmSSO-check', '#cmSSO-diag'].forEach((sel) => {
-        const el = box.querySelector(sel);
-        if (el) el.disabled = on;
-      });
-    };
-    box.querySelector('#cmSSO-diag')?.addEventListener('click', async () => {
-      busy(true);
-      try { await diagnoseCart(m, r); } finally { busy(false); }
-    });
-    box.querySelector('#cmSSO-check')?.addEventListener('click', async () => {
-      busy(true);
-      try { await addBasketToCart(m, r, { dryRun: true }); } finally { busy(false); }
-    });
-    box.querySelector('#cmSSO-add')?.addEventListener('click', async () => {
-      const n = r.lines.reduce((a, l) => a + l.length, 0);
-      if (!confirm(`Add ${n} cards from ${r.sellers.length} sellers to your Cardmarket cart?\n\n`
-        + 'This does not buy anything \u2014 you review each order in the cart before checkout.')) return;
-      busy(true);
-      try { await addBasketToCart(m, r, { dryRun: false }); } finally { busy(false); }
-    });
-    box.querySelector('#cmSSO-copy')?.addEventListener('click', async (ev) => {
-      const text = shoppingList(m, r);
-      const btn = ev.target.closest('button') || ev.target;
-      if (await copyText(text)) {
-        btn.textContent = 'Copied';
-        setTimeout(() => { btn.textContent = 'Copy shopping list'; }, 1500);
-        return;
-      }
-      // Blocked: put it on screen so it can still be selected by hand.
-      const out = box.querySelector('#cmSSO-cart-out');
-      out.innerHTML = `<div class="alert alert-info mb-0">
-        <div class="small mb-1">Your browser would not let the script use the clipboard — select and copy this:</div>
-        <textarea class="form-control form-control-sm" rows="8" readonly></textarea></div>`;
-      const ta = out.querySelector('textarea');
-      ta.value = text;
-      ta.focus();
-      ta.select();
-    });
+      ${r.gaps.length ? `<div class="row">
+        <div class="col-12 col-lg-6 mb-3"><h6>Missing from this basket</h6><div class="cmSSO-small">${gapList(m, r.gaps)}</div></div>
+        <div class="col-12 col-lg-6 mb-3"><h6>Best seller to add next</h6>
+          <table class="table table-sm cmSSO-small"><thead><tr><th class="text-start">Seller</th><th class="text-center">Cards added</th>
+            <th class="text-end">New total</th></tr></thead>
+          <tbody>${fillers.map((f) => `<tr><td class="text-start">${sellerLink(f.seller)}</td>
+            <td class="text-center">+${f.adds}</td><td class="text-end">${euro(f.result.total)}</td></tr>`).join('')
+            || '<tr><td colspan="3" class="text-muted">nothing left to add</td></tr>'}</tbody></table></div>
+      </div>` : ''}`;
   }
 
-  /*
-   * Card picker — park the maybes and re-run the numbers, no rescanning
-   */
+  function renderInsights(m, search, wiz, singles) {
+    const items = [];
+    const bestSingle = singles.slice().sort((a, b) => b.found - a.found || a.total - b.total)[0];
+    if (bestSingle) {
+      const done = completeOf(m, bestSingle.idx);
+      items.push(`<li><strong>Biggest single seller:</strong> ${sellerLink(bestSingle.sellers[0])} has
+        ${bestSingle.found} of ${m.reachableUnits} cards (${euro(bestSingle.total)}).
+        ${bestSingle.gaps.length
+          ? `Topped up from ${done.added.map(sellerLink).join(' + ') || 'nobody in this scan'}: ${euro(done.combo.total)} all in.`
+          : 'It covers everything on its own.'}</li>`);
+    }
 
-  let VIEW = null;                                   // last scan, unfiltered
-  let excluded = new Set(readJSON(EXCL_KEY, []));
-  let cardsOpen = false;
+    const draggers = m.wanted.map((w, i) => ({ w, c: costOfCard(m, search, i) }))
+      .filter((x) => x.c && x.c.saving > 0.01 && x.c.fewerParcels > 0)
+      .sort((a, b) => b.c.saving - a.c.saving);
+    if (draggers.length) {
+      const top = draggers[0];
+      items.push(`<li><strong>${cardSearchLink(top.w.name)} costs more than it looks:</strong> dropping it saves
+        ${euro(top.c.saving)} and ${plural(top.c.fewerParcels, 'parcel')} — the card is ${euro(top.c.cardSaved)},
+        the rest is shipping it drags along.${draggers.length > 1 ? ` ${draggers.length - 1} more like it in the card list.` : ''}</li>`);
+    }
 
-  function saveExcluded() { writeJSON(EXCL_KEY, [...excluded]); }
+    const clashes = wizardContradictions(m, wiz);
+    if (clashes.length) {
+      items.push(`<li class="text-danger"><strong>The scan missed ${plural(clashes.length, 'card')} the wizard did find:</strong>
+        ${clashes.slice(0, 6).map((x) => cardSearchLink(x.w.name)).join(', ')}${clashes.length > 6 ? ` +${clashes.length - 6}` : ''}.
+        Usually a saved scan from another wants list or tighter filters — clear saved prices and scan again.</li>`);
+    }
+    if (m.nobodyHas.length) {
+      items.push(`<li><strong>Not available from these ${m.S} sellers:</strong>
+        ${m.nobodyHas.map((w) => cardSearchLink(w.name)).join(', ')} — not in any total above.</li>`);
+    }
+    return items.length ? `<ul class="small mb-3 ps-3">${items.join('')}</ul>` : '';
+  }
 
   // Per-card facts that do not depend on which cards are currently included.
   function cardStats(wanted, matrix, sellerNames) {
@@ -1645,29 +1699,25 @@
   }
 
   function renderCards(m, search, stats) {
-    const rows = stats.map((st) => {
+    const rows = stats.map((st, n) => {
       const off = excluded.has(st.w.key);
       const i = m.wanted.findIndex((x) => x.key === st.w.key);
       const cost = (!off && i >= 0) ? costOfCard(m, search, i) : null;
       const worth = cost && cost.saving > 0.01;
       return {
         st, off, sort: worth ? cost.saving : -1,
-        html: `<tr class="${off ? 'text-muted' : ''}">
+        html: `<tr class="${off ? 'text-muted' : ''}" data-name="${esc(st.w.key)}">
           <td class="text-start"><div class="form-check mb-0">
-            <input class="form-check-input" type="checkbox" data-card="${st.w.key}" id="cx-${st.w.key}" ${off ? '' : 'checked'}>
-            <label class="form-check-label" for="cx-${st.w.key}">${st.w.name}${st.w.qty > 1 ? ` ×${st.w.qty}` : ''}</label>
+            <input class="form-check-input" type="checkbox" data-card="${esc(st.w.key)}" id="cmSSO-cx-${n}" ${off ? '' : 'checked'}>
+            <label class="form-check-label" for="cmSSO-cx-${n}">${esc(st.w.name)}${st.w.qty > 1 ? ` ×${st.w.qty}` : ''}</label>
           </div></td>
           <td class="text-end">${st.cheapest == null ? '<span class="text-danger">none</span>' : euro(st.cheapest)}</td>
           <td class="text-center">${st.sellers}</td>
           <td class="text-end">${off ? '<span class="text-muted">parked</span>'
             : worth ? `<span class="text-success fw-bold">−${euro(cost.saving)}</span>
                 ${cost.fewerParcels > 0
-                  ? `<div class="small text-warning-emphasis">${euro(cost.cardSaved)} card + ${euro(cost.shipSaved)} shipping
-                     — drops ${cost.fewerParcels} parcel${cost.fewerParcels === 1 ? '' : 's'}</div>`
-                  : cost.shipSaved > 0.05
-                    ? `<div class="small text-muted">${euro(cost.cardSaved)} card + ${euro(cost.shipSaved)} cheaper shipping</div>`
-                    : '<div class="small text-muted">just its own price</div>'}`
-            : '<span class="text-muted">nothing</span>'}</td>
+                  ? `<div class="small text-warning-emphasis">drops ${plural(cost.fewerParcels, 'parcel')}</div>` : ''}`
+            : '<span class="text-muted">—</span>'}</td>
         </tr>`,
       };
     });
@@ -1677,29 +1727,27 @@
     const lonely = stats.filter((st) => st.sellers === 1 && !excluded.has(st.w.key)).length;
 
     return `
-      <details id="cmSSO-cards" class="mb-3" ${cardsOpen ? 'open' : ''}>
-        <summary><strong>Cards included: ${stats.length - off} of ${stats.length}</strong>
-          ${off ? `<span class="text-muted"> — ${off} parked</span>` : ''}
-          <span class="text-muted small"> · untick a maybe and everything below recalculates</span></summary>
-
-        <div class="d-flex flex-wrap gap-2 my-2">
-          <button type="button" class="btn btn-sm btn-outline-secondary" data-bulk="lonely">Park the ${lonely} card${lonely === 1 ? '' : 's'} only one seller has</button>
-          <div class="input-group input-group-sm" style="width:14rem">
+      <details id="cmSSO-cards" class="mb-2" ${cardsOpen ? 'open' : ''}>
+        <summary><strong>Cards: ${stats.length - off} of ${stats.length} included</strong>
+          ${off ? `<span class="text-muted"> · ${off} parked</span>` : ''}
+          <span class="text-muted small"> · untick a maybe and everything recalculates</span></summary>
+        <div class="d-flex flex-wrap gap-2 my-2 align-items-center">
+          <input type="search" class="form-control form-control-sm" id="cmSSO-cardfilter" placeholder="Find a card…"
+            style="max-width:14rem" value="${esc(cardFilter)}">
+          <div class="input-group input-group-sm" style="width:13rem">
             <span class="input-group-text">Park over</span>
             <input type="number" class="form-control" id="cmSSO-overprice" min="0" step="0.5" value="5" aria-label="price limit">
             <span class="input-group-text">€</span>
             <button type="button" class="btn btn-outline-secondary" data-bulk="over">Go</button>
           </div>
-          <button type="button" class="btn btn-sm btn-outline-secondary" data-bulk="reset">Include everything</button>
+          ${lonely ? `<button type="button" class="btn btn-sm btn-outline-secondary" data-bulk="lonely">Park ${plural(lonely, 'single-seller card')}</button>` : ''}
+          ${off ? '<button type="button" class="btn btn-sm btn-outline-secondary" data-bulk="reset">Include everything</button>' : ''}
         </div>
-
-        <p class="small text-muted mb-2">“What it costs you” is how much the cheapest complete order would drop
-          if you dropped that card — a card that forces its own parcel costs far more than its price tag.</p>
         <div class="table-responsive" style="max-height:24rem;overflow-y:auto">
           <table class="table table-sm table-striped align-middle mb-0" id="cmSSO-cardtable">
             <thead class="position-sticky top-0 bg-white"><tr>
               <th class="text-start">Card</th><th class="text-end">Cheapest</th>
-              <th class="text-center">Sellers</th><th class="text-end">What it costs you</th>
+              <th class="text-center">Sellers</th><th class="text-end" title="How much the cheapest complete order drops without this card">Dropping saves</th>
             </tr></thead>
             <tbody>${rows.map((r) => r.html).join('')}</tbody>
           </table>
@@ -1707,10 +1755,20 @@
       </details>`;
   }
 
+  function applyCardFilter() {
+    const q = normName(cardFilter);
+    document.querySelectorAll('#cmSSO-cardtable tbody tr').forEach((tr) => {
+      tr.hidden = !!q && !(tr.getAttribute('data-name') || '').includes(q);
+    });
+  }
+
   function wireCards(stats) {
     const det = document.querySelector('#cmSSO-cards');
     if (!det) return;
     det.addEventListener('toggle', () => { cardsOpen = det.open; });
+    const filter = det.querySelector('#cmSSO-cardfilter');
+    filter?.addEventListener('input', () => { cardFilter = filter.value; applyCardFilter(); });
+    applyCardFilter();
 
     det.querySelector('#cmSSO-cardtable')?.addEventListener('change', (e) => {
       const key = e.target.getAttribute('data-card');
@@ -1736,205 +1794,180 @@
     });
   }
 
-  /*
-   * Seller picker — see who will be scanned before spending the time
-   */
+  function renderSingles(m, wiz, singles) {
+    const rows = singles.slice().sort((a, b) => b.found - a.found || a.total - b.total).map((r) => {
+      const s = r.sellers[0];
+      const country = wiz.sellers.find((x) => x.username === s)?.country || '';
+      const done = completeOf(m, r.idx);
+      return `<tr data-single="${r.idx[0]}">
+        <td class="text-start">${sellerLink(s)} <span class="text-muted small">${esc(country)}</span></td>
+        <td class="text-center" style="min-width:6rem">${r.found} / ${m.reachableUnits}<div class="cmSSO-bar mt-1"><i style="width:${pct(r.coverage)}"></i></div></td>
+        <td class="text-end">${euro(r.total)}<div class="text-muted small">${euro(r.ship)} ship</div></td>
+        <td class="text-end fw-bold">${euro(done.combo.total)}
+          <div class="text-muted small fw-normal">${done.added.length ? `+ ${esc(done.added.join(', '))}` : 'on its own'}</div></td>
+      </tr>`;
+    }).join('');
+    return `
+      <details id="cmSSO-singles-wrap" class="mb-2" ${singlesOpen ? 'open' : ''}>
+        <summary><strong>Every seller on its own</strong>
+          <span class="text-muted small"> · click a row to load it above</span></summary>
+        <div class="table-responsive mt-2">
+          <table class="table table-sm table-striped table-hover align-middle mb-0" id="cmSSO-singles">
+            <thead><tr><th class="text-start">Seller</th><th class="text-center">Cards</th>
+              <th class="text-end">Alone</th><th class="text-end" title="Plus the cheapest sellers for what it lacks">Complete order</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </details>`;
+  }
 
-  let ranking = [];
-
-  function renderResults(wiz, wanted, matrix, shipping, sellerNames, skipped) {
-    VIEW = { wiz, wanted, matrix, shipping, sellerNames, skipped: skipped || [] };
+  function renderResults(wiz, wanted, matrix, shipping, sellerNames) {
+    VIEW = { wiz, wanted, matrix, shipping, sellerNames };
     draw();
   }
 
   function draw() {
     if (!VIEW) return;
-    const { wiz, wanted, matrix, shipping, sellerNames, skipped } = VIEW;
+    const { wiz, wanted, matrix, shipping, sellerNames } = VIEW;
     const scrollY = window.scrollY;
     const active = wanted.filter((w) => !excluded.has(w.key));
     if (!active.length) {
+      STATE = null;
       document.querySelector('#cmSSO-results').innerHTML =
-        `<hr><div class="alert alert-warning">Every card is parked. Tick at least one to see an analysis.</div>`;
+        `<hr><div class="alert alert-warning">Every card is parked. Tick at least one to see an analysis.</div>
+         ${renderCards(buildModel([], matrix, shipping, sellerNames), { complete: [] }, cardStats(wanted, matrix, sellerNames))}`;
+      wireCards(cardStats(wanted, matrix, sellerNames));
       return;
     }
-    drawAnalysis(wiz, active, wanted, matrix, shipping, sellerNames, skipped);
+    drawAnalysis(wiz, active, wanted, matrix, shipping, sellerNames);
     window.scrollTo({ top: scrollY });
   }
 
-  function drawAnalysis(wiz, wanted, allWanted, matrix, shipping, sellerNames, skipped) {
+  function drawAnalysis(wiz, wanted, allWanted, matrix, shipping, sellerNames) {
     const m = buildModel(wanted, matrix, shipping, sellerNames);
     const stats = cardStats(allWanted, matrix, sellerNames);
+    const results = document.querySelector('#cmSSO-results');
 
-    // Nothing found anywhere is a broken scan, not an answer. Say so rather
-    // than declaring some seller the winner of an empty basket.
+    // Nothing found anywhere is a broken scan, not an answer.
     if (!m.reachableUnits) {
-      document.querySelector('#cmSSO-results').innerHTML = `
+      STATE = null;
+      results.innerHTML = `
         <hr>
         <div class="alert alert-danger">
           <h5 class="mb-2">The scan found none of your cards</h5>
           <p class="mb-2">Not one of the ${m.S} sellers matched a single card, which means the scan
-            failed rather than the sellers being empty. Any totals shown from this would be meaningless.</p>
-          <p class="mb-1"><strong>Most likely:</strong></p>
+            failed rather than the sellers being empty.</p>
           <ul class="mb-2">
             <li>${langUnknown > 0
-              ? `${langUnknown} offers were rejected because their language could not be read — set
-                 <strong>Language</strong> to “Any language” and run again to confirm.`
+              ? `${langUnknown} offers were rejected because their language could not be read — untick all
+                 languages under <strong>Filters</strong> and run again to confirm.`
               : 'The card names on the sellers\' pages did not match your list.'}</li>
-            <li>Your filters may be too tight — check Min. condition and the skip options.</li>
+            <li>Your filters may be too tight — check condition and the skip options.</li>
             <li>The wants list picked above may not be the one this wizard run used.</li>
           </ul>
-          <button type="button" class="btn btn-sm btn-outline-danger" id="cmSSO-wipe">Clear saved prices and start over</button>
+          <button type="button" class="btn btn-sm btn-outline-danger" data-act="wipe">Clear saved prices and start over</button>
         </div>`;
-      document.querySelector('#cmSSO-wipe')?.addEventListener('click', () => {
-        cache = {};
-        cacheFlush();
-        localStorage.removeItem(SCAN_KEY);
-        document.querySelector('#cmSSO-results').innerHTML =
-          '<hr><div class="alert alert-info">Cleared. Adjust the settings above and run the scan again.</div>';
-      });
       return;
     }
-    const search = searchBaskets(m, Math.min(cfg.maxCombo, sellerNames.length));
 
+    const search = searchBaskets(m, Math.min(cfg.maxCombo, sellerNames.length));
     const singles = [];
     for (let j = 0; j < m.S; j++) singles.push(evalCombo(m, [j]));
+    STATE = { m, search, wiz, singles, basket: null, busy: false };
 
-    const wizardLine = wiz.wizardTotal != null
-      ? `The wizard wanted <strong>${euro(wiz.wizardTotal)}</strong> — ${euro(wiz.wizardCards)} in cards plus ${euro(wiz.wizardShipping)} shipping across ${wiz.wizardShipments} parcels.`
-      : '';
-
-    const sellerRows = singles.slice().sort((a, b) => b.found - a.found || a.total - b.total).map((r) => {
-      const s = r.sellers[0];
-      const country = wiz.sellers.find((x) => x.username === s)?.country || '';
-      const done = completeOf(m, r.idx);
-      return `<tr data-single="${r.idx[0]}" style="cursor:pointer">
-        <td class="text-start">${sellerLink(s)} <span class="text-muted small">${country}</span></td>
-        <td class="text-center">${r.found} / ${m.reachableUnits}</td>
-        <td class="text-center">${pct(r.coverage)}<div class="cmSSO-bar mt-1"><i style="width:${pct(r.coverage)}"></i></div></td>
-        <td class="text-end">${euro(r.cardCost)}</td>
-        <td class="text-end">${euro(r.ship)}</td>
-        <td class="text-end">${euro(r.total)}</td>
-        <td class="text-end fw-bold">${euro(done.combo.total)}
-          <div class="text-muted small">${done.added.length ? `+ ${done.added.join(', ')}` : 'on its own'}</div></td>
-        <td class="text-start cmSSO-missing">${r.gaps.length
-          ? `<details><summary>${r.gaps.length} missing</summary>${gapList(m, r.gaps)}</details>`
-          : '<span class="text-success">has everything</span>'}</td>
-        <td class="text-end"><button type="button" class="btn btn-sm btn-outline-success" data-cart="s:${r.idx[0]}" title="Add this basket to your cart"><span class="fonticon-cart"></span></button></td>
-      </tr>`;
-    }).join('');
-
-    document.querySelector('#cmSSO-results').innerHTML = `
+    const parked = allWanted.filter((w) => excluded.has(w.key)).length;
+    results.innerHTML = `
       <hr>
-      <p class="small text-muted">${wizardLine}
-        Analysing ${m.wantedUnits} cards against ${m.S} sellers; ${m.reachableUnits} of them exist somewhere in this scan.
-        Every basket below buys all ${m.reachableUnits}, so the totals are directly comparable — a line-up cannot look
-        cheap by leaving expensive cards out. Click any row for the card-by-card breakdown.
-        ${(() => {
-          const parked = allWanted.filter((w) => excluded.has(w.key)).length;
-          return parked ? `<strong>${parked} card${parked === 1 ? '' : 's'} parked</strong> and left out of these numbers.` : '';
-        })()}
-        ${skipped && skipped.length ? `<br><span class="text-warning-emphasis">${skipped.length} seller${skipped.length === 1 ? ' was' : 's were'} not scanned</span>
-          (<span title="${skipped.map((x) => x.username).join(', ')}">${skipped.slice(0, 6).map((x) => x.username).join(', ')}${skipped.length > 6 ? ` +${skipped.length - 6} more` : ''}</span>),
-          so a cheaper line-up may exist. Raise “Max. sellers to scan” and run again — already-scanned sellers come from cache, so only the new ones cost time.` : ''}</p>
-
+      ${renderHero(m, search)}
+      ${renderInsights(m, search, wiz, singles)}
       ${renderCards(m, search, stats)}
+      ${renderSingles(m, wiz, singles)}
+      <p class="small text-muted mt-3 mb-0">
+        ${wiz.wizardTotal != null ? `Wizard: ${euro(wiz.wizardTotal)}${wiz.wizardCards != null ? ` (${euro(wiz.wizardCards)} cards + ${euro(wiz.wizardShipping)} shipping${wiz.wizardShipments ? `, ${plural(wiz.wizardShipments, 'parcel')}` : ''})` : ''}. ` : ''}
+        ${m.wantedUnits} cards against ${m.S} sellers; ${m.reachableUnits} exist somewhere in this scan.
+        ${parked ? `${plural(parked, 'card')} parked.` : ''}
+        Shipping is taken from the wizard page — a bigger parcel can cost a little more to ship.
+      </p>`;
 
-      ${renderRecommendations(m, search, wiz, singles)}
-
-      <h5 class="mt-4">Every seller on its own</h5>
-      <p class="small text-muted mb-2">"Complete order" is what that seller costs once the cards it lacks are added from the cheapest other sellers.</p>
-      <div class="table-responsive">
-        <table class="table table-sm table-striped align-middle" id="cmSSO-singles">
-          <thead><tr>
-            <th class="text-start">Seller</th><th class="text-center">Cards</th><th class="text-center">Coverage</th>
-            <th class="text-end">Cards €</th><th class="text-end">Shipping</th><th class="text-end">Alone</th>
-            <th class="text-end">Complete order</th><th class="text-start">Missing</th><th></th>
-          </tr></thead>
-          <tbody>${sellerRows}</tbody>
-        </table>
-      </div>
-
-      <div id="cmSSO-detail"></div>`;
-
-    const show = (r) => {
-      renderDetail(m, r);
-      document.querySelector('#cmSSO-detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    };
-    const bind = (sel, attr, pick) => {
-      document.querySelector(sel)?.addEventListener('click', (e) => {
-        const tr = e.target.closest(`tr[${attr}]`);
-        if (!tr || e.target.tagName === 'A' || e.target.closest('details')) return;
-        if (e.target.closest('button[data-cart]')) return;   // handled below
-        show(pick(tr.getAttribute(attr)));
-      });
-    };
     wireCards(stats);
-    bind('#cmSSO-singles tbody', 'data-single', (v) => evalCombo(m, [+v]));
+    const sd = document.querySelector('#cmSSO-singles-wrap');
+    sd?.addEventListener('toggle', () => { singlesOpen = sd.open; });
+    showBasket(search.complete[0] || singles.slice().sort((a, b) => b.found - a.found || a.total - b.total)[0]);
+  }
 
-    const slider = document.querySelector('#cmSSO-parcels');
-    const summary = document.querySelector('#cmSSO-pick-summary');
-    const cheapest = search.complete[0];
-    const showK = (k) => {
-      const r = search.bestByK[k];
-      if (!r || !summary) return;
-      const vs = wiz.wizardTotal != null ? r.total - wiz.wizardTotal : null;
-      const extra = cheapest ? r.total - cheapest.total : 0;
-      summary.innerHTML = `
-        <div class="border rounded p-2">
-          <div class="d-flex justify-content-between flex-wrap gap-2">
-            <div><strong>${r.sellers.map(sellerLink).join(' + ')}</strong></div>
-            <div><strong>${euro(r.total)}</strong>
-              <span class="text-muted small">${euro(r.cardCost)} cards + ${euro(r.ship)} shipping</span></div>
-          </div>
-          <div class="small mt-1">
-            ${extra < 0.005
-              ? '<span class="badge text-bg-success">cheapest</span>'
-              : `<span class="text-muted">${euro(extra)} more than the cheapest option</span>`}
-            ${vs != null ? ` · <span class="${vs < 0 ? 'text-success' : 'text-danger'}">${vs < 0 ? '−' : '+'}${euro(Math.abs(vs))} vs the wizard</span>` : ''}
-          </div>
-        </div>`;
-      renderDetail(m, r);
-    };
-    if (slider) {
-      slider.addEventListener('input', () => {
-        let k = Number(slider.value);
-        // not every parcel count is reachable; snap to the nearest that is
-        if (!search.bestByK[k]) {
-          for (let d = 1; d <= search.bestByK.length; d++) {
-            if (search.bestByK[k - d]) { k -= d; break; }
-            if (search.bestByK[k + d]) { k += d; break; }
-          }
-          slider.value = String(k);
-        }
-        showK(k);
-      });
-      showK(Number(slider.value));
-    } else if (cheapest) {
-      renderDetail(m, cheapest);
+  // One delegated handler for everything inside the results, installed once.
+  async function onResultsClick(e) {
+    const t = e.target;
+    const actEl = t.closest('[data-act]');
+    const act = actEl?.getAttribute('data-act');
+
+    if (act === 'wipe') {
+      cache = {};
+      cacheFlush();
+      localStorage.removeItem(SCAN_KEY);
+      document.querySelector('#cmSSO-results').innerHTML =
+        '<hr><div class="alert alert-info">Cleared. Adjust the settings above and run the scan again.</div>';
+      return;
+    }
+    if (!STATE) return;
+    const { m, search } = STATE;
+
+    if (act === 'k') { showBasket(search.bestByK[+actEl.getAttribute('data-k')]); return; }
+    if (act === 'stop') { aborted = true; return; }
+
+    const row = t.closest('tr[data-single]');
+    if (row && !t.closest('a, details > summary, button')) {
+      showBasket(evalCombo(m, [+row.getAttribute('data-single')]));
+      document.querySelector('#cmSSO-results .cmSSO-hero')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      return;
     }
 
-    // Cart buttons in every table: open that basket, then add it.
-    document.querySelector('#cmSSO-results')?.addEventListener('click', async (e) => {
-      const btn = e.target.closest('button[data-cart]');
-      if (!btn) return;
-      e.stopPropagation();
-      const v = btn.getAttribute('data-cart') || '';
-      const basket = v.startsWith('s:')
-        ? evalCombo(m, [Number(v.slice(2))])
-        : search.complete[Number(v.slice(2))];
-      if (!basket) return;
+    const r = STATE.basket;
+    if (!r || !act || STATE.busy) return;
 
-      renderDetail(m, basket);
-      const n = basket.lines.reduce((a, l) => a + l.length, 0);
-      if (!confirm(`Add ${n} cards from ${basket.sellers.join(' + ')} to your Cardmarket cart?\n\n`
-        + 'This does not buy anything \u2014 you review each order in the cart before checkout.\n'
-        + 'If an earlier attempt left anything in the cart, clear it first to avoid duplicates.')) return;
+    if (act === 'copy') {
+      const text = shoppingList(m, r);
+      if (await copyText(text)) {
+        actEl.textContent = 'Copied';
+        setTimeout(() => { actEl.textContent = 'Copy list'; }, 1500);
+        return;
+      }
+      const out = document.querySelector('#cmSSO-cart-out');
+      out.innerHTML = `<div class="alert alert-info mb-0">
+        <div class="small mb-1">Your browser blocked the clipboard — select and copy this:</div>
+        <textarea class="form-control form-control-sm" rows="8" readonly></textarea></div>`;
+      const ta = out.querySelector('textarea');
+      ta.value = text;
+      ta.focus();
+      ta.select();
+      return;
+    }
 
-      btn.disabled = true;
-      document.querySelector('#cmSSO-detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      try { await addBasketToCart(m, basket, { dryRun: false }); } finally { btn.disabled = false; }
-    });
-
+    if (act === 'add' || act === 'check' || act === 'diag') {
+      if (act === 'add') {
+        const n = r.lines.reduce((a, l) => a + l.length, 0);
+        if (!confirm(`Add ${n} cards from ${r.sellers.length} seller${r.sellers.length === 1 ? '' : 's'} to your Cardmarket cart?\n\n`
+          + 'This does not buy anything — you review each order in the cart before checkout. '
+          + 'Articles already in your cart are detected and skipped.')) return;
+      }
+      STATE.busy = true;
+      const hero = document.querySelector('#cmSSO-results .cmSSO-hero');
+      const btns = hero ? [...hero.querySelectorAll('button[data-act]:not([data-act="stop"])')] : [];
+      const stop = hero?.querySelector('[data-act="stop"]');
+      btns.forEach((b) => { b.disabled = true; });
+      if (stop && act !== 'diag') stop.hidden = false;
+      try {
+        if (act === 'diag') await diagnoseCart(m, r);
+        else await addBasketToCart(m, r, { dryRun: act === 'check' });
+      } catch (err) {
+        const out = document.querySelector('#cmSSO-cart-out');
+        if (out) out.innerHTML = `<div class="alert alert-danger">Stopped: ${esc(err.message)}</div>`;
+      } finally {
+        STATE && (STATE.busy = false);
+        btns.forEach((b) => { b.disabled = false; });
+        if (stop) stop.hidden = true;
+      }
+    }
   }
 
   /*
@@ -1948,12 +1981,7 @@
     runBtn.disabled = true;
     stopBtn.hidden = false;
     panel.querySelector('.cmSSO-log').innerHTML = '';
-
-    // Pull settings out of the form
-    cfg.minCondition = panel.querySelector('#cmSSO-cond').value;
-    const lang = panel.querySelector('#cmSSO-lang').value;
-    cfg.languages = lang ? [lang] : [];
-    writeJSON(CFG_KEY, cfg);
+    readFilters(panel);
 
     try {
       // 1. Wanted cards
@@ -1961,60 +1989,45 @@
       let wanted;
       const wantlistId = panel.querySelector('#cmSSO-wantlist').value || null;
       if (source === 'wantlist') {
-        const id = wantlistId;
-        if (!id) { ui.note('Pick a wants list first.', 'warn'); return; }
-        ui.progress(0, 1, 'Reading wantlist…');
-        wanted = await fetchWantlist(id);
-        if (!wanted.length) {
-          ui.note('Could not read that wantlist. Paste the cards instead.', 'warn');
-          return;
-        }
+        if (!wantlistId) { ui.note('Pick a wants list first.', 'warn'); return; }
+        ui.progress(0, 1, 'Reading wants list…');
+        wanted = await fetchWantlist(wantlistId);
+        if (!wanted.length) { ui.note('Could not read that wants list.', 'warn'); return; }
       } else {
         wanted = wantedFromWizard(wiz);
       }
       if (!wanted.length) { ui.note('No cards to look for.', 'warn'); return; }
 
-      // The wants filter needs a real wants list; otherwise fall back.
-      const fast = !!wantlistId;   // the wants list is required up front
+      const fast = !!wantlistId;
 
       // Every seller gets scanned; the ranking only decides the order, so a
       // stopped run still has the most useful sellers done.
-      const ranked = rankSellers(wiz.sellers);
-      const chosen = ranked;
-      const skipped = [];
-      const sellerNames = chosen.map((x) => x.username);
+      const sellerNames = rankSellers(wiz.sellers).map((x) => x.username);
       const shipping = {};
       wiz.sellers.forEach((x) => { shipping[x.username] = x.shipping ?? cfg.defaultShipping; });
 
       let param = null;
       if (!fast) {
-        const probeSeller = chosen.find((s) => s.articles.length) || wiz.sellers.find((s) => s.articles.length);
+        const probeSeller = wiz.sellers.find((s) => s.articles.length);
         ui.progress(0, 1, 'Checking how seller search works…');
         param = await probeSearchParam(probeSeller.username, probeSeller.articles[0].name);
-      }
-      if (!fast && !param) {
-        ui.note('Cardmarket\'s seller offer search did not respond as expected — nothing was scraped. Open a seller\'s offer page, search a card, and send me the resulting URL so I can fix the parameter.', 'warn');
-        return;
+        if (!param) {
+          ui.note('Cardmarket\'s seller offer search did not respond as expected — nothing was scraped.', 'warn');
+          return;
+        }
       }
       langUnknown = 0;
       ui.note('Keep this tab open while it runs. Each seller is saved as it finishes, '
-        + 'so if the browser interrupts you, running again picks up where it stopped.');
-      ui.note(cfg.languages.length
-        ? `Only ${cfg.languages.join(' / ')} printings will be considered.`
-        : 'All languages will be considered.');
+        + 'so running again picks up where it stopped.');
+      ui.note(`Filters: ${filterSummary()}.`);
 
       const fresh = sellerNames.filter((n) => !cacheGet(n, SCANNED_MARK));
-      // ~3 printings per card, ~20 rows a page
-      const pagesEach = Math.max(1, Math.ceil((wanted.length * 3) / 20));
+      const pagesEach = Math.max(1, Math.ceil((wanted.length * 3) / 20));   // ~3 printings per card, ~20 rows a page
       const reqs = fast ? fresh.length * pagesEach : fresh.length * wanted.length;
       const mins = Math.max(1, Math.round((reqs * ((cfg.minDelay + cfg.maxDelay) / 2)) / (fast ? 1 : cfg.concurrency) / 60000));
-      ui.note(fast
-        ? `Sweeping each seller's wants-filtered pages. ${fresh.length} of ${sellerNames.length} sellers still need scanning `
-          + `— roughly ${mins} minute${mins === 1 ? '' : 's'}. The rest come from the last scan.`
-        : `Seller search uses "${param}". ${wanted.length} cards x ${fresh.length} new sellers `
-          + `= about ${reqs} lookups, roughly ${mins} minute${mins === 1 ? '' : 's'}.`);
+      ui.note(`${fresh.length} of ${sellerNames.length} sellers need scanning — roughly ${plural(mins, 'minute')}. The rest come from the last scan.`);
 
-      // 3. Scrape
+      // 2. Scrape
       const matrix = {};
       const wantedByKey = new Map(wanted.map((w) => [w.key, w]));
       const total = sellerNames.length * wanted.length;
@@ -2023,8 +2036,8 @@
       const started = Date.now();
       const eta = () => {
         const spent = (Date.now() - started) / 1000;
-        const fresh = Math.max(1, done - reused);
-        const left = Math.round((spent / fresh) * (total - done));
+        const work = Math.max(1, done - reused);
+        const left = Math.round((spent / work) * (total - done));
         return `about ${Math.floor(left / 60)}m ${left % 60}s left`;
       };
 
@@ -2032,10 +2045,7 @@
         if (aborted) break;
         matrix[seller] = {};
 
-        // Reuse a seller only when the earlier sweep actually covered every card
-        // we are asking about now. A partial hit means it was swept for a
-        // different list, and treating the gaps as "not stocked" is how a card
-        // the seller plainly has ends up reported as available from nobody.
+        // Reuse a seller only when the earlier sweep covered every card we ask about now.
         const covered = cacheGet(seller, SCANNED_MARK)
           && wanted.every((w) => cacheGet(seller, w.key) !== null);
         if (covered) {
@@ -2053,11 +2063,8 @@
             });
             matrix[seller] = res.cards;
 
-            /*
-             * The wizard proved which cards this seller stocks. If the sweep
-             * missed one, the sweep is at fault, so look it up by name rather
-             * than recording it as unstocked.
-             */
+            // The wizard proved which cards this seller stocks. If the sweep
+            // missed one, look it up by name rather than recording it as unstocked.
             const proof = [...new Set((wiz.sellers.find((x) => x.username === seller)?.articles || [])
               .map((a) => normName(a.name))
               .filter((k) => wantedByKey.has(k) && !(matrix[seller][k] || []).length))];
@@ -2074,17 +2081,15 @@
                   if (!r.cached) await sleep(jitter());
                 } catch { /* leave it empty */ }
               }
-              ui.note(`${seller}: the sweep missed ${proof.length} card${proof.length === 1 ? '' : 's'} `
-                + `the wizard found there; recovered ${recovered} by name.`
-                + (recovered === 0 && !param ? ' The name search could not be set up for this seller.' : ''),
-                recovered < proof.length ? 'warn' : 'info');
+              if (recovered < proof.length) {
+                ui.note(`${seller}: ${proof.length - recovered} card${proof.length - recovered === 1 ? '' : 's'} the wizard found there `
+                  + 'did not pass your filters or could not be found.', 'warn');
+              }
             }
 
-            if (res.hitCap) {
-              ui.note(`${seller}: stopped at the ${res.pages}-page limit — their list may be longer than that.`, 'warn');
-            }
+            if (res.hitCap) ui.note(`${seller}: stopped at the ${res.pages}-page limit.`, 'warn');
             done += wanted.length;
-            ui.progress(done, total, `${seller} — ${res.pages} page${res.pages === 1 ? '' : 's'} · ${eta()}`);
+            ui.progress(done, total, `${seller} — ${plural(res.pages, 'page')} · ${eta()}`);
           } catch (e) {
             if (String(e.message).startsWith('blocked')) {
               aborted = true;
@@ -2119,7 +2124,6 @@
             done++;
             if (hitCache) reused++;
             ui.progress(done, total, `${seller} — ${want.name}${hitCache ? ' (cached)' : ` · ${eta()}`}`);
-            // Only pace real requests; cached lookups cost nothing.
             if (!hitCache) await sleep(jitter());
           }
         };
@@ -2131,14 +2135,13 @@
       cacheFlush();
       if (cfg.languages.length && langUnknown > 40) {
         ui.note(`${langUnknown} offers were skipped because their language could not be read. `
-          + 'If coverage looks too thin, switch Language to "Any language" and compare.', 'warn');
+          + 'If coverage looks thin, untick all languages under Filters and compare.', 'warn');
       }
       const usable = sellerNames.filter((s) => matrix[s]);
-      writeJSON(SCAN_KEY, { t: Date.now(), wanted, matrix, shipping, sellerNames: usable,
-        skipped: skipped.map((x) => ({ username: x.username, articles: x.articleCount, stock: x.stock })) });
+      writeJSON(SCAN_KEY, { t: Date.now(), wanted, matrix, shipping, sellerNames: usable });
       panel.querySelector('#cmSSO-reanalyse').hidden = false;
       ui.progress(done, total, aborted ? 'Stopped — showing what was collected' : 'Done');
-      renderResults(wiz, wanted, matrix, shipping, usable, skipped);
+      renderResults(wiz, wanted, matrix, shipping, usable);
       document.querySelector('#cmSSO-results').scrollIntoView({ behavior: 'smooth', block: 'start' });
     } finally {
       runBtn.disabled = false;
@@ -2157,51 +2160,39 @@
 
     injectStyles();
     const panel = buildPanel(wiz);
-
-    const sourceSel = panel.querySelector('#cmSSO-source');
-    sourceSel.addEventListener('change', async () => {
-      void sourceSel.value;
-    });
+    panel.querySelector('#cmSSO-filter-sum').textContent = filterSummary();
+    panel.querySelector('#cmSSO-filters').addEventListener('change', () => readFilters(panel));
+    panel.querySelector('#cmSSO-results').addEventListener('click', onResultsClick);
 
     (async () => {
       const sel = panel.querySelector('#cmSSO-wantlist');
       try {
         const lists = await fetchWantlists(wiz.sellers[0]?.username);
         sel.innerHTML = lists.length
-          ? `<option value="">— none —</option>` + lists.map((l) => `<option value="${l.id}">${l.name}</option>`).join('')
+          ? '<option value="">— none (slower name search) —</option>'
+            + lists.map((l) => `<option value="${l.id}">${esc(l.name)}</option>`).join('')
           : '<option value="">No wants lists found</option>';
         // Newest list first is usually the one the wizard was just run on.
         const newest = lists.slice().sort((a, b) => Number(b.id) - Number(a.id))[0];
         if (newest) sel.value = newest.id;
       } catch {
         sel.innerHTML = '<option value="">Could not load your wants lists</option>';
-        ui.note('Could not read your wants lists — the fast sweep needs one. '
-          + 'Reload the page, or scan without it (slower).', 'warn');
+        ui.note('Could not read your wants lists. Reload the page, or scan without one (slower).', 'warn');
       }
     })();
 
-    panel.querySelector('#cmSSO-run').addEventListener('click', () => {
-      const sel = panel.querySelector('#cmSSO-wantlist');
-      if (!sel.value) {
-        sel.classList.add('is-invalid');
-        ui.progress(0, 1, 'Pick the wants list this wizard run used, then scan.');
-        return;
-      }
-      sel.classList.remove('is-invalid');
-      run(wiz, panel);
-    });
+    panel.querySelector('#cmSSO-run').addEventListener('click', () => run(wiz, panel));
 
     const reBtn = panel.querySelector('#cmSSO-reanalyse');
     const saved = readJSON(SCAN_KEY, null);
     if (saved && saved.sellerNames?.length) {
       reBtn.hidden = false;
-      reBtn.title = `Scanned ${new Date(saved.t).toLocaleString()}`;
+      reBtn.title = `Show the scan from ${new Date(saved.t).toLocaleString()} again`;
     }
     reBtn.addEventListener('click', () => {
       const scan = readJSON(SCAN_KEY, null);
       if (!scan) return;
-      writeJSON(CFG_KEY, cfg);
-      renderResults(wiz, scan.wanted, scan.matrix, scan.shipping, scan.sellerNames, scan.skipped || []);
+      renderResults(wiz, scan.wanted, scan.matrix, scan.shipping, scan.sellerNames);
     });
     panel.querySelector('#cmSSO-stop').addEventListener('click', () => {
       aborted = true;
