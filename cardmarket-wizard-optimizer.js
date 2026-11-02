@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cardmarket Shopping Wizard — Single-Seller Optimizer
 // @namespace    cm-shopping-wizard-optimizer
-// @version      2.2.1
+// @version      2.2.2
 // @description  Re-checks every seller from a Shopping Wizard result individually and tells you which basket to actually buy. Prices every option as a complete order, so fewer parcels can win.
 // @author       you
 // @match        https://www.cardmarket.com/*/Wants/ShoppingWizard/Results/*
@@ -952,6 +952,8 @@
             </div>
             <div class="d-flex flex-wrap gap-2 align-items-center">
               <button id="cmSSO-clear" type="button" class="btn btn-sm btn-outline-secondary">Clear saved prices</button>
+              <button id="cmSSO-samples" type="button" class="btn btn-sm btn-outline-secondary"
+                title="Download the raw HTML of the pages this script reads, to help fix parsing">Save page samples</button>
               <span class="text-muted">Filters apply to the next scan; prices are cached per filter set.</span>
             </div>
           </div>
@@ -2100,6 +2102,52 @@
   }
 
   /*
+   * Page samples: the raw HTML (what a fetch sees, scripts not run) of every
+   * page this script parses, bundled into one JSON file. Session tokens are
+   * blanked out before saving.
+   */
+  async function saveSamples(wiz, panel) {
+    panel.querySelector('#cmSSO-progress').hidden = false;
+    const base = `${location.origin}/${LANG_SEG}/${GAME_SEG}`;
+    const listId = panel.querySelector('#cmSSO-wantlist').value || null;
+    const seller = wiz.sellers.find((s) => s.articles.length)?.username || wiz.sellers[0]?.username;
+    const pages = [
+      ['wizard-results', location.href],
+      ['wants-overview', `${base}/Wants`],
+      listId && ['wantlist', `${base}/Wants/${listId}`],
+      listId && seller && ['seller-wants-filtered', sellerWantlistUrl(seller, listId, 1)],
+      seller && ['seller-offers', `${base}/Users/${encodeURIComponent(seller)}/Offers/Singles`],
+      ['cart', `${base}/ShoppingCart`],
+    ].filter(Boolean);
+
+    const scrub = (html) => html
+      .replace(/(name=["']__cmtkn["'][^>]*value=["'])[^"']*/gi, '$1REDACTED')
+      .replace(/(value=["'])[^"']*(["'][^>]*name=["']__cmtkn)/gi, '$1REDACTED$2')
+      .replace(/("__cmtkn"\s*:\s*")[^"]*/g, '$1REDACTED');
+
+    const out = { saved: new Date().toISOString(), script: '2.2.2', listId, seller, pages: {},
+      renderedWizard: scrub(document.documentElement.outerHTML) };
+    for (const [name, url] of pages) {
+      ui.note(`Saving ${name}…`);
+      try {
+        const res = await fetch(url, { credentials: 'same-origin', cache: 'no-store' });
+        out.pages[name] = { url, status: res.status, html: scrub(await res.text()) };
+      } catch (e) {
+        out.pages[name] = { url, error: String(e.message) };
+      }
+      await sleep(jitter());
+    }
+    const blob = new Blob([JSON.stringify(out, null, 1)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `cardmarket-samples-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
+    ui.note('Samples saved to your downloads. Contains your username and lists; session tokens are removed.');
+  }
+
+  /*
    * Boot
    */
 
@@ -2151,6 +2199,11 @@
     panel.querySelector('#cmSSO-stop').addEventListener('click', () => {
       aborted = true;
       ui.note('Stopping after the requests in flight…');
+    });
+    panel.querySelector('#cmSSO-samples').addEventListener('click', async (ev) => {
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try { await saveSamples(wiz, panel); } finally { btn.disabled = false; }
     });
     panel.querySelector('#cmSSO-clear').addEventListener('click', () => {
       cache = {};
